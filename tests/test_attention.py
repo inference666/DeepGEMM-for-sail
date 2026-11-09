@@ -312,7 +312,7 @@ def test_int8_sparse_edges(check_accuracy=True):
         print('Skipping INT8 sparse edges: requires PPU1.0')
         return
     from utils import decode_sparse_metadata, ref_sparse_metadata, verify_sparse_metadata
-    from utils import ref_int8_sparse_mqa_logits, bf16_fma_reference
+    from utils import ref_int8_sparse_mqa_logits, bf16_fma_reference, get_sparse_num_slots
 
     if check_accuracy:
         # Single-round BF16 FMA differs from FP32-then-BF16 at these midpoints.
@@ -438,19 +438,41 @@ def test_int8_sparse_edges(check_accuracy=True):
             ks, ke, num_kv, indices, torch.int8, block, use_unaligned_ks=unaligned)
         logits = deep_gemm.int8_sparse_mqa_logits(
             q, (k, scales), weights, metadata, capacity, block, use_unaligned_ks=unaligned)
-        decoded = decode_sparse_metadata(metadata, block)
+        # Decode only the initialized split/schedule prefix, not the unused
+        # worst-case metadata allocation. Header word 3 is alignment padding.
+        num_splits, num_waves, _ = metadata[:12].view(torch.int32).cpu().tolist()
+        split_bytes = 16 + (128 // block) * 8
+        live_bytes = 16 + num_splits * split_bytes + num_waves * get_sparse_num_slots() * 16
+        assert 16 <= live_bytes <= metadata.numel()
+        decoded = decode_sparse_metadata(metadata[:live_bytes], block)
         verify_sparse_metadata(decoded, ref_sparse_metadata(
             indices, counts, ks, ke, num_kv, block, capacity, unaligned), rows)
         dense = deep_gemm.int8_mqa_logits(
             q, (k, scales), weights, ks, ke, clean_logits=False,
             max_seqlen_k=num_kv, logits_dtype=torch.bfloat16)
-        gathered, valid = gather_sparse_reference(dense, indices, counts, ks, ke, block)
-        tokens = (indices.long()[:, :, None] * block + (ks % block)[:, None, None]
-                  + torch.arange(block, device='cuda')).flatten(1).clamp(max=num_kv - 1)
-        expected = ref_int8_sparse_mqa_logits(q, k[tokens], scales[tokens], weights)
-        assert valid.any() and logits.dtype == torch.bfloat16
-        torch.testing.assert_close(gathered[valid], expected[valid], rtol=0, atol=0)
-        torch.testing.assert_close(logits[:, :capacity * block][valid], expected[valid], rtol=0, atol=0)
+        # Q4 bounds the gathered-K FP32 temporary: the new B16 ring8 case
+        # would otherwise materialize 161 * 2112 * 128 * 4 = 174 MB at once.
+        # Both dense gather and the exact BF16 reference still check every
+        # valid position, including real physical tails and the odd final Q.
+        checked_positions = 0
+        for begin in range(0, rows, 4):
+            end = min(begin + 4, rows)
+            gathered, valid = gather_sparse_reference(
+                dense[begin:end], indices[begin:end], counts[begin:end], ks[begin:end], ke[begin:end], block)
+            tokens = (indices[begin:end].long()[:, :, None] * block
+                      + (ks[begin:end] % block)[:, None, None]
+                      + torch.arange(block, device='cuda')).flatten(1).clamp(max=num_kv - 1)
+            expected = ref_int8_sparse_mqa_logits(
+                q[begin:end], k[tokens], scales[tokens], weights[begin:end])
+            assert logits.dtype == torch.bfloat16
+            torch.testing.assert_close(gathered[valid], expected[valid], rtol=0, atol=0)
+            torch.testing.assert_close(logits[begin:end, :capacity * block][valid], expected[valid], rtol=0, atol=0)
+            checked_positions += int(valid.sum().item())
+        expected_positions = sum(
+            max(0, min(block, end - (selected * block + start % block)))
+            for start, end, selected_row in zip(starts, ends, selections)
+            for selected in selected_row)
+        assert checked_positions == expected_positions > 0
         return decoded
 
     # Unaligned unions can satisfy the first/last span test without being
@@ -471,12 +493,36 @@ def test_int8_sparse_edges(check_accuracy=True):
     # the short paired Q still needs its original per-block slot masks.
     for block, tail in ((8, 1), (16, 15)):
         end = 67 * block + tail
-        repeats = 4 * deep_gemm.get_num_sms() if block == 8 else 1
+        repeats = get_sparse_num_slots() if block == 8 else 1
         starts = [3 * block, 66 * block] * repeats + [67 * block]
         selections = [list(range(3, 68)), [66, 67]] * repeats + [[67]]
         decoded = check_partial_layout(block, starts, [end] * len(starts), selections)
         if block == 8:
             assert any(entry[1] - entry[0] >= 5 for entry in decoded['schedule'])
+
+    # Ring8 metadata prefetch needs a schedule entry with more than 8 splits.
+    # Every long Q selects 132 gapped blocks. Pairing it with two nearby tail
+    # blocks gives 133 aligned / 134 unaligned union blocks: 9 B8 or 17 B16
+    # splits. Repeating once per schedule slot guarantees at least one whole
+    # long pair survives slot-window cuts, regardless of atomic reservation order.
+    # The final Q is odd, starts inside the real last block and has no padded K.
+    for block, unaligned, tail in ((8, False, 1), (16, False, 15),
+                                   (8, True, 3), (16, True, 3)):
+        repeats = get_sparse_num_slots()
+        off0, off1 = (1, 2) if unaligned else (0, 0)
+        end = 265 * block + tail
+        starts = [3 * block + off0, 264 * block + off1] * repeats + [265 * block + off0]
+        selections = [list(range(3, 266, 2)), [264, 265]] * repeats + [[265]]
+        assert len(selections[0]) == 132
+        decoded = check_partial_layout(block, starts, [end] * len(starts), selections, unaligned=unaligned)
+        union_blocks = 134 if unaligned else 133
+        pair_splits = (union_blocks + 128 // block - 1) // (128 // block)
+        assert decoded['num_kv_splits'] == repeats * pair_splits + 1
+        live_entries = [entry for entry in decoded['schedule'] if entry[0] < entry[1]]
+        longest_entry = max(entry[1] - entry[0] for entry in live_entries)
+        assert longest_entry >= pair_splits >= 9, (block, unaligned, longest_entry)
+        print(f'Ring8 metadata wrap passed: B={block}, unaligned={unaligned}, '
+              f'rows={len(starts)}, splits={decoded["num_kv_splits"]}, max_entry={longest_entry}')
 
     # Invalid host contracts must fail before a device kernel can read a bad
     # pointer/header. Keep these calls on the already-warmed, valid fixture.
@@ -534,6 +580,279 @@ def test_int8_sparse_edges(check_accuracy=True):
         for case, (_, outputs) in zip(cases, captured):
             case.check(outputs)
     print('Passed INT8 sparse contracts, merge/slot boundaries, two-stream graph replay and workspace growth')
+
+
+def test_int8_paged_sparse_edges(check_accuracy=True):
+    """Native SoA cache addressing, request-local pairing and replay regressions."""
+    if get_arch_version() != 80:
+        print('Skipping INT8 paged sparse edges: requires PPU1.0')
+        return
+    from utils import pack_int8_sparse_paged_cache, unpack_int8_sparse_paged_cache
+    from utils import check_int8_paged_sparse_reference_chunks, check_int8_paged_sparse_nonpaged
+    from utils import decode_sparse_metadata, ref_paged_sparse_metadata, verify_paged_sparse_metadata
+    from utils import get_sparse_num_slots
+
+    class PagedCase:
+        def __init__(self, block, page, repeats=1, long=False, long_blocks=132, all_same_request=False):
+            self.block, self.page, self.long = block, page, long
+            self.repeats = repeats
+            self.long_blocks, self.all_same_request = long_blocks, all_same_request
+            self.rows, self.cap = (161, long_blocks) if long else (9 * repeats, 16)
+            self.tail = 1 if block == 8 else 15
+            max_len = (2 * long_blocks + 1) * block + self.tail if long else max(4 * page + 3, 32 * block + 3)
+            self.max_pages = (max_len + page - 1) // page
+            self.physical_pages = max(8, self.max_pages)
+            channel, head = torch.arange(128, device='cuda'), torch.arange(32, device='cuda')
+            self.q = ((torch.arange(self.rows, device='cuda')[:, None, None] * 11
+                       + head[None, :, None] * 7 + channel[None, None, :] * 5) % 255 - 127).to(torch.int8).unsqueeze(1)
+            self.q[0, 0, 0, 0], self.q[-1, 0, -1, -1] = -128, 127
+            self.weights = ((head % 5 - 2) / 64).to(torch.bfloat16).expand(self.rows, 32).contiguous()
+            self.weights[1].fill_(-1 / 32)
+            if not long:
+                self.q[5].zero_()
+            k = torch.zeros((self.physical_pages, page, 128), device='cuda', dtype=torch.int8)
+            scales = torch.ones((self.physical_pages, page), device='cuda', dtype=torch.float32)
+            # A full extra 512B of poison makes stride!=payload even for page128.
+            self.cache = pack_int8_sparse_paged_cache(k, scales, extra_page_padding=512)
+            self.lens = torch.empty(self.rows, device='cuda', dtype=torch.int32)
+            self.table = torch.empty((self.rows, self.max_pages), device='cuda', dtype=torch.int32)
+            self.indices = torch.empty((self.rows, self.cap), device='cuda', dtype=torch.int32)
+            self.requests = torch.empty(self.rows, device='cuda', dtype=torch.int32)
+            self.update(0)
+
+        def update(self, phase):
+            b, p = self.block, self.page
+            self.phase = phase
+            # Change run boundaries at graph replay, including 0 -> 1 -> 0.
+            # A request ID identifies a contiguous run, not a globally unique key.
+            if self.all_same_request or (not self.long and phase % 3 == 2):
+                self.request_values = [0] * self.rows
+            elif self.long:
+                self.request_values = [i // 2 for i in range(self.rows)]
+            else:
+                pattern = ([0, 0, 1, 0, 0, 0, 1, 1, 1] if phase % 3 == 1 else
+                           [0, 1, 1, 1, 2, 2, 0, 0, 0])
+                self.request_values = pattern * self.repeats
+            self.requests.copy_(torch.tensor(self.request_values, dtype=torch.int32))
+            if self.long:
+                lens = ([128 * b] * 160 + [1] if phase % 2 else
+                        [(2 * self.long_blocks + 1) * b + self.tail] * 160 + [1])
+                selected = [list(range(128)) if phase % 2 else list(range(3, 2 * self.long_blocks + 2, 2))
+                            for _ in range(160)] + [[0]]
+            else:
+                # Odd request groups [1,3,2,3], zero context, token/block/page
+                # boundaries, one zero-Q row and a real last partial block.
+                lens = [0, 1, 3 * p + 1 + phase % 3, 16 * b, 4 * p + 1 + phase % 3,
+                        2 * b - 1, 2 * b, 32 * b + 3, 32 * b + 1] * self.repeats
+                if phase % 3 == 1:
+                    lens[0], lens[1] = 1, 0  # Paired Q0 nonempty / Q1 empty.
+                selected = []
+                for row, length in enumerate(lens):
+                    available = (length + b - 1) // b
+                    count = min(self.cap, available)
+                    blocks = (list(range(count)) if available <= self.cap else
+                              [i * (available - 1) // (count - 1) for i in range(count)])
+                    selected.append(blocks)
+            self.counts = [min(self.cap, (length + b - 1) // b) for length in lens]
+            assert self.counts == list(map(len, selected))
+            # Existing sparse API contract: valid logical IDs are unique and
+            # strictly increasing. Repeated physical pages remain legal below.
+            assert all(all(left < right for left, right in zip(blocks, blocks[1:])) for blocks in selected)
+            assert all(all(0 <= index * b < length for index in blocks) for length, blocks in zip(lens, selected))
+            tables = []
+            pattern = [0, 2, 1, 3, 7, 4, 7, 5, 6]
+            for request in self.request_values:
+                mapping = [(pattern[j % len(pattern)] + request * 3 + phase) % self.physical_pages
+                           for j in range(self.max_pages)]
+                mapping[-1] = self.physical_pages - 1
+                tables.append(mapping)
+            self.lens.copy_(torch.tensor(lens, dtype=torch.int32))
+            self.table.copy_(torch.tensor(tables, dtype=torch.int32))
+            self.indices.copy_(torch.tensor([blocks + [0] * (self.cap - len(blocks)) for blocks in selected], dtype=torch.int32))
+            self.expected_valid = sum(min(b, length - index * b) for length, blocks in zip(lens, selected) for index in blocks)
+            k, scales = unpack_int8_sparse_paged_cache(self.cache)
+            token = torch.arange(self.physical_pages * p, device='cuda').view(self.physical_pages, p)
+            channel = torch.arange(128, device='cuda')
+            k.copy_(((token[:, :, None] * 13 + channel[None, None, :] * 17 + phase * 19) % 255 - 127).to(torch.int8))
+            k[-1, -1, 0] = -128
+            scales.copy_(((token + phase) % 7 + 1).float() / 128)
+
+        def run(self):
+            metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                self.lens, self.table, self.requests, self.page, self.indices, torch.int8, self.block)
+            logits = deep_gemm.int8_paged_sparse_mqa_logits(
+                self.q, self.cache, self.weights, metadata, self.cap, self.block)
+            return metadata, logits
+
+        def check(self, outputs, secondary=False):
+            metadata, logits = outputs
+            assert logits.shape == (self.rows, (self.cap * self.block + 511) // 512 * 512)
+            assert logits.dtype == torch.bfloat16
+            splits, waves, unaligned = metadata[:12].view(torch.int32).cpu().tolist()
+            live = 16 + splits * (16 + 128 // self.block * 8) + waves * get_sparse_num_slots() * 16
+            assert 16 <= live <= metadata.numel() and unaligned == 0
+            decoded = decode_sparse_metadata(metadata[:live], self.block)
+            ref = ref_paged_sparse_metadata(self.indices, self.counts, self.lens, self.table,
+                                            self.requests, self.page, self.block, self.cap)
+            verify_paged_sparse_metadata(decoded, ref, self.rows, self.requests)
+            checked = check_int8_paged_sparse_reference_chunks(self.q, self.cache, self.weights, logits,
+                self.lens, self.table, self.indices, self.counts, self.block, chunk_size=4)
+            assert checked == self.expected_valid
+            if secondary:
+                check_int8_paged_sparse_nonpaged(self.q, self.cache, self.weights, logits, self.lens,
+                    self.table, self.requests, self.indices, self.counts, self.block, self.cap)
+            if not self.long:
+                if self.counts[1]:
+                    assert (logits[1, :min(self.block, int(self.lens[1].item()))] < 0).any()
+                assert logits[5, :2 * self.block - 1].count_nonzero().item() == 0
+                if self.phase % 3 == 1 and not self.all_same_request:
+                    paired_empty = [s for s in decoded['splits'] if s['q_token_base'] == 0]
+                    unpaired = [s for s in decoded['splits'] if s['q_token_base'] == 2]
+                    assert paired_empty and all(s['q1_slot_base'] != 0xffff for s in paired_empty)
+                    assert unpaired and all(s['q1_slot_base'] == 0xffff for s in unpaired)
+                    assert any(e[2:] == (0, 2) for e in decoded['schedule'])
+                    assert any(e[2:] == (2, 1) for e in decoded['schedule'])
+            return decoded
+
+    # Minimal P==B, non-power-of-two pages, normal deployment page sizes,
+    # whole-stage same-page AIU, page crossing and physical-page reuse.
+    cases = [PagedCase(block, page) for block, page in
+             ((8, 8), (16, 16), (8, 24), (8, 32), (16, 48), (8, 64), (8, 128), (16, 128))]
+    for case in cases:
+        outputs = case.run()
+        if check_accuracy:
+            decoded = case.check(outputs, secondary=True)
+            assert any(s['is_contiguous'] and s['num_kv_blocks'] < 128 // case.block
+                       for s in decoded['splits']), 'Missing partial same-page contiguous hint'
+            if case.page in (24, 48):
+                assert any(case.page // case.block < s['num_kv_blocks'] < 128 // case.block and
+                           not s['is_contiguous'] for s in decoded['splits']), \
+                    'Missing partial non-power-of-two-page crossing without hint'
+            if case.block == 8 and case.page == 32:
+                # [0,2,1,3] page order gives a 16-block tile whose first/last
+                # span looks contiguous but whose middle physical blocks are not.
+                found = False
+                for split in decoded['splits']:
+                    offsets = [x[0] for x in split['blocks'][:split['num_kv_blocks']]]
+                    if len(offsets) == 16 and offsets[-1] - offsets[0] == 15:
+                        if offsets != list(range(offsets[0], offsets[0] + 16)):
+                            assert not split['is_contiguous'], 'False-contiguous physical endpoints received a hint'
+                            found = True
+                assert found, 'Missing false-contiguous physical-page fixture'
+            print(f'Native paged layout passed: B={case.block}, page_kv={case.page}, '
+                  f'rows={case.rows}, valid_positions={case.expected_valid}')
+    for block, page, selected_blocks in ((8, 64, 132), (16, 128, 132), (16, 128, 256)):
+        long_case = PagedCase(block, page, long=True, long_blocks=selected_blocks)
+        outputs = long_case.run()
+        if check_accuracy:
+            decoded = long_case.check(outputs)
+            per_pair = (selected_blocks + 128 // block - 1) // (128 // block)
+            assert decoded['num_kv_splits'] == 80 * per_pair + 1
+            entries = [e for e in decoded['schedule'] if e[0] < e[1]]
+            assert max(e[1] - e[0] for e in entries) == per_pair > 8
+            # At least one whole pair survives the split-window cuts, giving
+            # actual single-entry 9/17/32-split metadata ring8 wrap coverage.
+            print(f'Native paged ring8 wrap passed: B={block}, page_kv={page}, '
+                  f'pair_splits={per_pair}, splits={decoded["num_kv_splits"]}, '
+                  f'waves={decoded["num_waves"]}, max_entry={max(e[1] - e[0] for e in entries)}')
+            long_case.update(1)
+            steady = long_case.check(long_case.run())
+            assert max(e[1] - e[0] for e in steady['schedule']) == block
+            print(f'Native paged contiguous entry passed: B={block}, page_kv={page}, max_entry={block}')
+    if not check_accuracy:
+        return
+
+    # Complete empty schedule, as distinct from one empty row in a nonempty CTA.
+    empty = PagedCase(8, 8)
+    empty.lens.zero_(); empty.counts = [0] * empty.rows; empty.expected_valid = 0
+    empty_outputs = empty.run()
+    decoded = decode_sparse_metadata(empty_outputs[0], 8)
+    assert decoded['num_kv_splits'] == 0
+    verify_paged_sparse_metadata(decoded, ref_paged_sparse_metadata(empty.indices, empty.counts, empty.lens,
+        empty.table, empty.requests, empty.page, empty.block, empty.cap), empty.rows, empty.requests)
+    assert check_int8_paged_sparse_reference_chunks(empty.q, empty.cache, empty.weights, empty_outputs[1],
+        empty.lens, empty.table, empty.indices, empty.counts, 8, chunk_size=4) == 0
+
+    base = cases[5]
+    metadata = base.run()[0]
+    valid = dict(q=base.q, kv_cache=base.cache, weights=base.weights, metadata=metadata,
+                 num_max_sparse_blocks=base.cap, sparse_block_kv=base.block)
+    unaligned_cache = torch.empty((base.physical_pages, base.page, 1, 132), device='cuda', dtype=torch.uint8)
+    misaligned_cache = torch.empty(base.physical_pages * base.cache.stride(0) + 1, device='cuda', dtype=torch.uint8).as_strided(
+        base.cache.shape, base.cache.stride(), storage_offset=1)
+    noncontiguous_q = torch.empty((base.rows, 1, 32, 256), device='cuda', dtype=torch.int8)[..., ::2]
+    invalid = [{'q': base.q.to(torch.bfloat16)}, {'q': base.q[:, 0]}, {'q': base.q.cpu()},
+               {'q': noncontiguous_q}, {'kv_cache': base.cache.to(torch.int8)},
+               {'kv_cache': base.cache[..., :128]}, {'kv_cache': base.cache.cpu()},
+               {'kv_cache': unaligned_cache}, {'kv_cache': misaligned_cache}, {'weights': base.weights.float()},
+               {'weights': base.weights[:, :31].contiguous()}, {'metadata': metadata.view(torch.int32)},
+               {'metadata': metadata.cpu()}, {'metadata': metadata[:-1]},
+               {'num_max_sparse_blocks': 3}, {'sparse_block_kv': 4}]
+    for changes in invalid:
+        try:
+            deep_gemm.int8_paged_sparse_mqa_logits(**{**valid, **changes})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f'INT8 paged sparse accepted invalid {next(iter(changes))}')
+    meta_args = dict(context_lens=base.lens, block_table=base.table, indices=base.requests,
+                     page_kv=base.page, sparse_kv_block_indices=base.indices,
+                     qk_dtype=torch.int8, sparse_block_kv=base.block)
+    invalid_meta = [{'context_lens': base.lens[:, None]}, {'context_lens': base.lens.cpu()},
+                    {'context_lens': base.lens.float()}, {'block_table': base.table.long()},
+                    {'block_table': base.table.flatten()}, {'block_table': base.table.cpu()},
+                    {'block_table': base.table[:, :0].contiguous()},
+                    {'indices': base.requests[:, None]}, {'indices': base.requests.long()},
+                    {'indices': base.requests.cpu()}, {'page_kv': 0}, {'page_kv': 9},
+                    {'sparse_kv_block_indices': base.indices[:, :3].contiguous()},
+                    {'sparse_kv_block_indices': base.indices.long()}]
+    for changes in invalid_meta:
+        try:
+            deep_gemm.get_paged_sparse_mqa_logits_metadata(**{**meta_args, **changes})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f'Paged metadata accepted invalid {next(iter(changes))}')
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graph_cases, captured = [cases[5], cases[-1]], []
+    for case, stream in zip(graph_cases, streams):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            case.run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = case.run()
+        captured.append((graph, outputs))
+    # Keep both graphs alive while the first stream obtains a larger workspace.
+    with torch.cuda.stream(streams[0]):
+        # 657 Q exceed two rounds of the 320-CTA metadata grid.
+        larger = PagedCase(8, 64, repeats=73, all_same_request=True)
+        larger_outputs = larger.run()
+    streams[0].synchronize()
+    larger.check(larger_outputs)
+    print(f'Native paged all-same request/multi-CTA claims passed: rows={larger.rows}')
+    # The same page table is legal for different requests. A one-token ID=1
+    # run between ID=0 runs puts boundaries at 31/32: initial claims at 63/64
+    # exercise a mismatch in ballot lane 31 and a full matching 32-ID chunk.
+    with torch.cuda.stream(streams[0]):
+        larger.requests[31] = 1
+        larger_outputs = larger.run()
+    streams[0].synchronize()
+    larger.check(larger_outputs)
+    print(f'Native paged recurrent-ID scan boundary passed: rows={larger.rows}, runs=[31,1,{larger.rows - 32}]')
+    del larger, larger_outputs
+    for phase in range(1, 4):
+        for case, stream, (graph, _) in zip(graph_cases, streams, captured):
+            with torch.cuda.stream(stream):
+                case.update(phase)
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for case, (_, outputs) in zip(graph_cases, captured):
+            case.check(outputs)
+    print('Passed native INT8 paged sparse SoA, aliases, strict unique IDs, repeated request-ID runs, ring8 wrap and two-stream graph replay')
 
 
 def test_sparse_workspace():
@@ -728,4 +1047,5 @@ if __name__ == '__main__':
     test_mqa_avg_logits_loop()
     test_sparse_mqa_logits_loop()
     test_int8_sparse_edges()
+    test_int8_paged_sparse_edges()
     test_sparse_workspace()

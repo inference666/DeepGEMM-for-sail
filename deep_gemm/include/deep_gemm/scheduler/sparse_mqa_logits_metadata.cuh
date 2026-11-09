@@ -9,7 +9,8 @@
 // `scheduler/sm100_sparse_mqa_logits_metadata.cuh`. One kernel serves both KV layouts via
 // `kIsPaged`: contiguous (per-Q-block claim, KS/KE windows, unaligned-ks rescale) and paged
 // (per-token claim, request-boundary Q pairing via `indices`, context_lens windows, block_table
-// physical resolution, bounded kNumKVSplitsPerEntry entries + wave balancing).
+// physical resolution). PPU0010 paged metadata balances split ranges across grid slots;
+// other architectures retain bounded kNumKVSplitsPerEntry entries + wave balancing.
 //
 // Per Q block (kBlockQ = 2 paired tokens), one CTA:
 //   1. merge-path partitions the two tokens' sorted sparse index rows (read straight from global;
@@ -18,8 +19,9 @@
 //   2. compacts via a CTA exclusive prefix sum and atomically reserves the block's KV-split range,
 //   3. writes KVSplitHeader + KVBlockInfo (physical block id + per-token slot offsets), padding the
 //      last partial split with invalid slots,
-// and the last CTA (release-incremented counter + acquire load) builds the per-SM schedule table:
-// KV splits are divided evenly across SMs, cut at Q-block boundaries, padded to whole waves.
+// and the last CTA (release-incremented counter + acquire load) builds the schedule table.
+// Non-paged and PPU0010 paged splits are divided evenly across grid slots, cut at Q-block
+// boundaries, and padded to whole waves.
 //
 // Note: logical index values are read straight from the global source rows (no shared-memory
 // staging); only the packed merge output crosses threads, via dynamic shared memory around
@@ -89,9 +91,9 @@ __device__ __forceinline__ uint32_t cta_exclusive_sum_u32(const uint32_t value, 
     return warp_sums[warp_idx] + inclusive - value;
 }
 
-// Divide `total` KV splits evenly across SMs, then cut each SM range at Q-block boundaries.
+// Divide `total` KV splits evenly across grid slots, then cut each range at Q-block boundaries.
 // `smem_max_entries[kNumSlots]` is per-thread scratch for the wave-count reduction.
-template <uint32_t kNumKVBlocksPerSplit, uint32_t kNumSlots, uint32_t kNumThreads>
+template <uint32_t kNumKVBlocksPerSplit, uint32_t kNumSlots, uint32_t kNumThreads, bool kIsPaged = false>
 __device__ __forceinline__ uint32_t build_contiguous_schedule(
     ScheduleEntry* schedule_entries, const KVSplit<kNumKVBlocksPerSplit>* kv_splits,
     const QBlockInfo* q_block_infos, const uint32_t num_q_tokens, const uint32_t total_kv_splits,
@@ -111,11 +113,20 @@ __device__ __forceinline__ uint32_t build_contiguous_schedule(
         const uint32_t kv_split_end = static_cast<uint32_t>(
             (static_cast<uint64_t>(total_kv_splits) * (slot + 1) + kNumSlots - 1) / kNumSlots);
         while (kv_split_idx < kv_split_end) {
-            const uint32_t q_token_base = kv_splits[kv_split_idx].header.q_token_base;
+            const auto& split_header = kv_splits[kv_split_idx].header;
+            const uint32_t q_token_base = split_header.q_token_base;
             const QBlockInfo q_block_info = q_block_infos[q_token_base];
             const uint32_t entry_kv_split_end = min(kv_split_end, q_block_info.kv_split_base + q_block_info.num_kv_splits);
+            uint32_t num_q_block_tokens;
+            if constexpr (kIsPaged) {
+                // This sentinel denotes an unpaired Q, not an empty second context.
+                // It preserves request boundaries even when the entry starts mid-pair.
+                num_q_block_tokens = split_header.q1_slot_base == kInvalidSparseSlot ? 1u : kBlockQ;
+            } else {
+                num_q_block_tokens = min(kBlockQ, num_q_tokens - q_token_base);
+            }
             schedule_entries[num_slot_entries * kNumSlots + slot] = ScheduleEntry(
-                kv_split_idx, entry_kv_split_end, q_token_base, min(kBlockQ, num_q_tokens - q_token_base));
+                kv_split_idx, entry_kv_split_end, q_token_base, num_q_block_tokens);
             kv_split_idx = entry_kv_split_end;
             ++num_slot_entries;
         }
@@ -249,6 +260,11 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
     constexpr uint32_t kNumKVSplitsPerEntry = 8;  // upstream host constant (bounded paged entries)
     constexpr uint32_t kNumMergedBlocksCap = kBlockQ * kNumMaxBlocksCap;
     constexpr uint32_t kNumKVBlocksPerThread = (kNumMergedBlocksCap + kNumThreads - 1) / kNumThreads;
+#if defined(__HGGC_ARCH__) && __HGGC_ARCH__ == 100
+    constexpr bool kUsePPU0010PagedMetadata = kIsPaged;
+#else
+    constexpr bool kUsePPU0010PagedMetadata = false;
+#endif
     DG_STATIC_ASSERT(not kIsPaged or (PAGE_KV > 0 and PAGE_KV % SPARSE_BLOCK_KV == 0), "Invalid page shape");
     DG_STATIC_ASSERT(not kIsPaged or not kUseUnalignedKs, "Paged sparse MQA does not use ks");
 
@@ -273,8 +289,62 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
     } q_block;
 
     uint32_t q_token_idx = blockIdx.x * (kIsPaged ? 1u : kBlockQ);
+    // The first warp caches the previous claim's run start. Claims increase
+    // monotonically within each CTA; no state survives a launch/graph replay.
+    uint32_t cached_q_token_idx = 0;
+    uint32_t cached_request_q_token_base = 0;
     while (true) {
-        if (tid == 0) {
+        if constexpr (kUsePPU0010PagedMetadata) {
+            if (tid < 32) {
+                // Only lane 0 claims work and publishes the shared descriptor.
+                // All 32 lanes participate in every shuffle/ballot, including
+                // claims skipped because their Q was paired with its predecessor.
+                q_token_idx = __shfl_sync(0xffffffffu, q_token_idx, 0);
+                if (tid == 0)
+                    q_block.num_q_tokens = 0;
+                while (q_token_idx < num_q_tokens) {
+                    const uint32_t request_idx = __shfl_sync(
+                        0xffffffffu, tid == 0 ? indices[q_token_idx] : 0u, 0);
+                    uint32_t request_q_token_base = q_token_idx;
+                    while (request_q_token_base > cached_q_token_idx) {
+                        const uint32_t count = min(32u, request_q_token_base - cached_q_token_idx);
+                        const bool different = tid < count and
+                            indices[request_q_token_base - 1u - tid] != request_idx;
+                        const uint32_t boundaries = __ballot_sync(0xffffffffu, different);
+                        if (boundaries != 0) {
+                            // Lane 0 is the nearest predecessor. Stop immediately
+                            // after the first different ID, even if IDs recur later.
+                            request_q_token_base -= static_cast<uint32_t>(__ffs(boundaries) - 1);
+                            break;
+                        }
+                        request_q_token_base -= count;
+                    }
+                    if (request_q_token_base == cached_q_token_idx)
+                        request_q_token_base = cached_request_q_token_base;
+                    cached_q_token_idx = q_token_idx;
+                    cached_request_q_token_base = request_q_token_base;
+                    if ((q_token_idx - request_q_token_base) % kBlockQ != 0) {
+                        if (tid == 0) {
+                            q_block_infos[q_token_idx] = QBlockInfo(0, 0);
+                            q_token_idx = gridDim.x + atomic_add_relaxed_global_u32(&workspace_state->next_q_offset, 1u);
+                        }
+                        q_token_idx = __shfl_sync(0xffffffffu, q_token_idx, 0);
+                        continue;
+                    }
+                    if (tid == 0) {
+                        const uint32_t num_q_block_tokens = q_token_idx + 1 < num_q_tokens and
+                            indices[q_token_idx + 1] == request_idx ? kBlockQ : 1;
+                        q_block.q_token_base = q_token_idx;
+                        q_block.num_q_tokens = num_q_block_tokens;
+                        q_block.num_kv_blocks[0] = min(num_max_sparse_blocks,
+                            math::ceil_div(context_lens[q_token_idx], SPARSE_BLOCK_KV));
+                        q_block.num_kv_blocks[1] = num_q_block_tokens == kBlockQ ? min(num_max_sparse_blocks,
+                            math::ceil_div(context_lens[q_token_idx + 1], SPARSE_BLOCK_KV)) : 0;
+                    }
+                    break;
+                }
+            }
+        } else if (tid == 0) {
             q_block.num_q_tokens = 0;
             while (q_token_idx < num_q_tokens) {
                 uint32_t num_q_block_tokens = min(kBlockQ, num_q_tokens - q_token_idx);
@@ -450,8 +520,10 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
             if (kv_block_idx_in_split == 0) {
                 const uint32_t num_kv_blocks_in_split = min(kNumKVBlocksPerSplit, num_merged_kv_blocks - merged_kv_block_idx);
                 bool is_contiguous = false;
-                if constexpr (not kIsPaged and not kUseUnalignedKs) {
-                    // Mark full, consecutive splits for the whole-tile AIU copy.
+                if constexpr ((not kIsPaged and not kUseUnalignedKs) or kUsePPU0010PagedMetadata) {
+                    // The merged logical IDs are strictly increasing and unique.
+                    // Endpoint distance therefore proves every intermediate ID;
+                    // paged copies must additionally stay in one logical page.
                     const uint32_t last_packed_slots =
                         packed_slots_by_merged_kv_block[merged_kv_block_idx + num_kv_blocks_in_split - 1];
                     const bool last_in_q0 = (last_packed_slots & kPresentBit) != 0;
@@ -464,8 +536,15 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
                         get_sparse_logical_block_value<kUseUnalignedKs, SPARSE_BLOCK_KV>(
                             sparse_kv_block_indices, cu_seq_len_k_start, q_token_base + 1,
                             num_max_sparse_blocks, last_q_slot_idx);
-                    is_contiguous = num_kv_blocks_in_split == kNumKVBlocksPerSplit and
-                                    last_logical_kv_block_idx == logical_kv_block_idx + num_kv_blocks_in_split - 1;
+                    if constexpr (kUsePPU0010PagedMetadata) {
+                        constexpr uint32_t kNumKVBlocksPerPage = PAGE_KV / SPARSE_BLOCK_KV;
+                        is_contiguous = last_logical_kv_block_idx == logical_kv_block_idx + num_kv_blocks_in_split - 1 and
+                                        logical_kv_block_idx / kNumKVBlocksPerPage ==
+                                            last_logical_kv_block_idx / kNumKVBlocksPerPage;
+                    } else {
+                        is_contiguous = num_kv_blocks_in_split == kNumKVBlocksPerSplit and
+                                        last_logical_kv_block_idx == logical_kv_block_idx + num_kv_blocks_in_split - 1;
+                    }
                 }
                 kv_splits[kv_split_idx].header.q_token_base = q_token_base;
                 kv_splits[kv_split_idx].header.packed_num_kv_blocks =
@@ -510,7 +589,13 @@ __device__ __forceinline__ void sparse_mqa_logits_metadata_device(
     const uint32_t total_kv_splits = workspace_state->num_kv_splits;
     const auto schedule_entries = reinterpret_cast<ScheduleEntry*>(kv_splits + total_kv_splits);
     uint32_t num_waves;
-    if constexpr (kIsPaged) {
+    if constexpr (kUsePPU0010PagedMetadata) {
+        // At most ceil(total_kv_splits / kNumSlots) entries fit in any column,
+        // so padding to num_waves still fits the existing metadata allocation.
+        num_waves = build_contiguous_schedule<kNumKVBlocksPerSplit, kNumSlots, kNumThreads, true>(
+            schedule_entries, kv_splits, q_block_infos, num_q_tokens, total_kv_splits, &smem_num_waves,
+            smem_max_entries);
+    } else if constexpr (kIsPaged) {
         num_waves = build_paged_schedule<kNumSlots, kNumKVSplitsPerEntry, kNumThreads>(
             schedule_entries, q_block_infos, num_q_tokens, indices, warp_sums, smem_histogram);
     } else {

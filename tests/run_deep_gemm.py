@@ -26,9 +26,7 @@ def device_version_supported(one_case):
         return False, 'INT8 indexer requires 810E'
     sparse_int8 = (one_case.get('gemm_type') in ('SparseMqaLogits', 'PagedSparseMqaLogits')
                    and data_type == torch.int8)
-    if sparse_int8 and one_case.get('gemm_type') == 'PagedSparseMqaLogits':
-        return False, 'Paged sparse INT8 MQA logits is not implemented'
-    if (sparse_int8 or one_case.get('case') == 'sparse_int8') and get_arch_version() != 80:
+    if (sparse_int8 or one_case.get('case') in ('sparse_int8', 'sparse_int8_paged')) and get_arch_version() != 80:
         return False, 'INT8 sparse MQA logits requires PPU1.0 (ZW810E, sm_80)'
     if one_case.get('device') == '810e' and 'ZW810E' not in torch.cuda.get_device_name():
         return False, 'This regression case requires ZW810E'
@@ -57,6 +55,9 @@ atexit.register(device_sync_at_exit)
 
 
 def run_attention_regression(args):
+    if args['case'] == 'sparse_int8_paged':
+        from test_attention import test_int8_paged_sparse_edges
+        return test_int8_paged_sparse_edges(check_accuracy=get_acc_check())
     if args['case'] == 'sparse_int8':
         from test_attention import test_int8_sparse_edges
         return test_int8_sparse_edges(check_accuracy=get_acc_check())

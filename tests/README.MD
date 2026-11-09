@@ -481,3 +481,52 @@ reference. Kernel timing follows the same method as other GEMM dtypes.
 Use EP32/groups=12 or EP64/groups=6, and up N/K=10240/7168 or down
 N/K=7168/5120. For another pre-routing batch B, set M=4*B and distribute
 those rows across the local experts.
+
+## Native INT8 paged sparse MQA (810E)
+
+Run the small native-page fixture and the boundary/replay regression from the repository root:
+
+```bash
+python tests/run_deep_gemm.py --format 'PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:64,check_metadata:1' --require_supported
+python tests/run_deep_gemm.py --format 'AttentionRegression,data_type:int8,case:sparse_int8_paged' --require_supported
+python tests/run_deep_gemm.py --caselist tests/workloads/sparse_mqa_native_paged_810e.list --case_idx 1 --require_supported --benchmark
+```
+
+The native workload list keeps source P8/P9/P10 as cases 1–3. Cases 4–5 use
+the compute-rich P6 request with identity/permuted physical pages. Original
+nonpaged workload lists are unchanged. The companion JSON records source
+lines, logical requests, effective QK counts and request-local metadata splits;
+these are CPU counts, not measured performance.
+
+The API takes INT8 Q `[T,1,32,128]`, BF16 weights with Q scales already folded
+in, and a uint8 cache shaped `[pages,page_kv,1,132]`. Each physical page stores
+all `page_kv*128` K bytes followed by all `page_kv*4` FP32 scale bytes (SoA).
+It is **not** a sequence of 132-byte token records. Page strides are rounded
+to 512 bytes. `utils.make_int8_paged_sparse_inputs(args)` returns the quantized
+inputs, page table, context lengths, request IDs and sparse selections for
+same-input layout comparisons. Its default physical page order is permuted.
+
+Every valid selected output is checked against a bounded independent page-table
+gather and the exact INT8/BF16 epilogue reference. Small regressions also compare
+per-request nonpaged sparse and dense INT8 outputs with zero tolerance. Tests
+cover B8/B16, minimum and non-power-of-two page sizes, page32/64/128, aliased
+physical pages, strictly increasing unique selected IDs, odd request boundaries, physical stride
+padding, empty/tail contexts and two-stream graph replay after workspace growth.
+On 810E, the paged schedule divides split indices across 80 slots and cuts each
+slot interval at request-local Q-pair boundaries. Tests verify every slot/wave
+entry and zero padding, and require actual 9/17/32-split entries to exercise
+metadata ring8 wrap. PPU1.5 retains its bounded-eight entries and exact stable
+wave-order verifier. Existing nonpaged ring8-wrap fixtures remain in place.
+Request IDs may recur in separate contiguous runs (for example 0,1,0). Tests
+cover an all-same long request, multiple persistent-CTA claims, paired Q1 with
+empty context, an unpaired Q followed by another request, and graph replay
+after changing request IDs/run boundaries on two streams.
+Repeated physical pages are supported; repeated logical IDs inside the valid
+selected prefix are outside the existing sparse API contract. Padding slots
+may repeat an ID because they are not valid selections. These tests do not
+extend the shared metadata scheduler's input contract.
+
+`--benchmark` reports separate metadata, compute and metadata+compute CUDA-graph
+timings (five groups, median/min/max); input quantization, page materialization,
+JIT and correctness checks are outside those timings. `--disable_acc` skips
+reference work, and `HGGC_WARM_UP` compiles without interpreting output data.

@@ -3,18 +3,19 @@
 #include <deep_gemm/impls/mqa_logits_utils.cuh>
 #include <deep_gemm/impls/sparse_mqa_logits_layout.cuh>
 #include <deep_gemm/tix/ld_st.cuh>
+#include <deep_gemm/tix/utils.cuh>
 
 namespace cutlass::gemm::kernel {
 
 namespace SML = deep_gemm::sparse_mqa_logits;
 
-// Non-paged INT8 sparse MQA. The metadata's physical indices are token offsets,
-// including the offset for unaligned ks, and are independent of the Q/K format.
+// INT8 sparse MQA. Non-paged physical indices are token offsets (including
+// unaligned ks); paged physical indices are sparse-block offsets in the page pool.
 // Q scales have already been folded into the BF16 per-head weights. The MMA and
 // BF16 epilogue match PPUMqaLogits; only the KV gather and output slots differ.
 template <typename ElementQK, typename ElementAcc, typename ElementLogits, typename ElementWeights,
           int BLOCK_QH, int BLOCK_KV, int WARP_QH, int WARP_KV, int kNumQStages, int kNumKVStages,
-          uint32_t SPARSE_BLOCK_KV, uint32_t kNumSlots>
+          uint32_t SPARSE_BLOCK_KV, uint32_t kNumSlots, bool kIsPaged = false, uint32_t PAGE_KV = 0>
 class PPUSparseMqaLogitsINT8 {
 public:
     static_assert(cute::is_same_v<ElementQK, int8_t> && cute::is_same_v<ElementAcc, int32_t>,
@@ -23,6 +24,7 @@ public:
                   cute::is_same_v<ElementWeights, __ppu_bfloat16>,
                   "INT8 sparse MQA requires BF16 weights and logits");
     static_assert(SPARSE_BLOCK_KV == 8 || SPARSE_BLOCK_KV == 16, "Invalid sparse block size");
+    static_assert(!kIsPaged || (PAGE_KV > 0 && PAGE_KV % SPARSE_BLOCK_KV == 0), "Invalid page shape");
     static_assert(BLOCK_QH == SML::kBlockQ * SML::kNumHeads && BLOCK_KV == SML::kSplitKV,
                   "INT8 sparse MQA must preserve the metadata's Q-pair and KV-split layout");
     static_assert(WARP_QH == SML::kNumHeads && (WARP_KV == 16 || WARP_KV == 32),
@@ -57,8 +59,8 @@ public:
                              PermutationMNK>;
     static constexpr int NumThreadsPerCTA = size(TiledMma{});
     static constexpr int MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
-    // Match the metadata's four persistent CTAs per CU. The launch bound keeps
-    // register pressure from reducing residency to three and adding a tail wave.
+    // Guide register allocation toward four resident CTAs on PPU0010. Actual
+    // residency also depends on other resources; the host selects grid slots separately.
     static constexpr int MinBlocksPerMultiprocessor = 4;
     static_assert(NumThreadsPerCTA >= BLOCK_M, "KV scale producers require one thread per row");
 
@@ -91,10 +93,16 @@ public:
     using StrideAB = Stride<Int<BLOCK_K>, _1>;
     using StrideWeights = Stride<Int<BLOCK_N>, _1>;
     using KVSplit = SML::KVSplit<kNumKVBlocksPerSplit>;
-    // One metadata slot beyond the KV pipeline lets the next split be fetched
-    // without overwriting metadata still read by the current epilogue.
-    static constexpr uint32_t kNumMetadataStages = kNumKVStages + 1;
+    // Iteration i commits metadata i+4 with KV i+2. Iteration i+1's wait<1>
+    // and CTA barrier publish that metadata before iteration i+2 loads KV i+4.
+    // Eight slots keep each record intact until its epilogue readers retire.
+    // Host dynamic shared memory must include all eight metadata records.
+    static constexpr uint32_t kNumMetadataStages = 8;
+    static constexpr uint32_t kMetadataPrefetchDistance = kNumKVStages + 1;
     static constexpr uint32_t kMetadataWordsPerSplit = sizeof(KVSplit) / sizeof(uint32_t);
+    static constexpr uint32_t kMetadataVectorsPerSplit = sizeof(KVSplit) / sizeof(uint4);
+    static_assert(sizeof(KVSplit) % sizeof(uint4) == 0 && alignof(KVSplit) >= alignof(uint4),
+                  "Async metadata requires whole aligned 16-byte vectors");
 
     struct SharedStorage {
         cute::array_aligned<ElementQK, cute::cosize_v<SmemLayoutA>> smem_k;
@@ -127,7 +135,11 @@ public:
         ElementLogits* logits;
         uint32_t logits_stride;
         uint32_t num_q_tokens;
+        // Non-paged: real K allocation length. Paged: num_pages * PAGE_KV,
+        // including the fully allocated last page, not the logical context length.
         uint32_t num_kv_tokens;
+        const uint8_t* kv_cache;
+        uint32_t kv_page_stride_bytes;
     };
     using Params = Arguments;
 
@@ -195,6 +207,32 @@ public:
         constexpr uint32_t kStageBytes = BLOCK_M * BLOCK_K;
         constexpr uint32_t kChunkBytes = SPARSE_BLOCK_KV * BLOCK_K;
 
+        // The tensor view [pages, PAGE_KV, 1, 132] describes the page footprint,
+        // not token-interleaved records: each page holds all K bytes, then all
+        // FP32 scales. Resolve addresses only after checking the physical token.
+        const auto resolve_k = [&](uint32_t physical, uint32_t token_in_block) -> const ElementQK* {
+            if constexpr (kIsPaged) {
+                constexpr uint32_t kBlocksPerPage = PAGE_KV / SPARSE_BLOCK_KV;
+                const uint32_t page_idx = physical / kBlocksPerPage;
+                const uint32_t row = (physical % kBlocksPerPage) * SPARSE_BLOCK_KV + token_in_block;
+                const uint8_t* page = params.kv_cache + static_cast<uint64_t>(page_idx) * params.kv_page_stride_bytes;
+                return reinterpret_cast<const ElementQK*>(page) + static_cast<uint64_t>(row) * BLOCK_K;
+            } else {
+                return params.ptr_k + (static_cast<uint64_t>(physical) + token_in_block) * BLOCK_K;
+            }
+        };
+        const auto resolve_scale = [&](uint32_t physical, uint32_t token_in_block) -> const float* {
+            if constexpr (kIsPaged) {
+                constexpr uint32_t kBlocksPerPage = PAGE_KV / SPARSE_BLOCK_KV;
+                const uint32_t page_idx = physical / kBlocksPerPage;
+                const uint32_t row = (physical % kBlocksPerPage) * SPARSE_BLOCK_KV + token_in_block;
+                const uint8_t* page = params.kv_cache + static_cast<uint64_t>(page_idx) * params.kv_page_stride_bytes;
+                return reinterpret_cast<const float*>(page + static_cast<uint64_t>(PAGE_KV) * BLOCK_K) + row;
+            } else {
+                return params.k_scales + static_cast<uint64_t>(physical) + token_in_block;
+            }
+        };
+
         auto load_q = [&](const SML::ScheduleEntry& entry, uint32_t valid_q) {
             const uint64_t q_head_offset = static_cast<uint64_t>(entry.q_token_base) * kNumHeads;
             // AIU pads the second Q token on an odd tail; no padded input is required.
@@ -216,28 +254,63 @@ public:
             }
         };
 
+        auto load_metadata_async = [&](uint32_t split_idx, uint32_t metadata_stage) {
+            // Nine producers for B8, five for B16. The record and every ring slot
+            // are 16-byte aligned, and no vector crosses a KVSplit boundary.
+            if (thread_idx < kMetadataVectorsPerSplit) {
+                const auto* src = reinterpret_cast<const uint4*>(splits + split_idx);
+                auto* dst = reinterpret_cast<uint4*>(&storage.smem_split_metadata[metadata_stage]);
+                PPU_CP_ASYNC_CACHEALWAYS<uint4>::copy(src[thread_idx], dst[thread_idx]);
+            }
+        };
+
         auto load_kv = [&](uint32_t metadata_stage, uint32_t stage) {
             const auto& split = storage.smem_split_metadata[metadata_stage];
             const uint32_t packed_count = deep_gemm::tix::ld_shared_u32(&split.header.packed_num_kv_blocks);
             const uint32_t num_blocks = SML::KVSplitHeader::get_num_kv_blocks(packed_count);
             const uint32_t first = deep_gemm::tix::ld_shared_u32(&split.kv_block_infos[0].physical_kv_block_idx);
-            // The shared metadata flag deliberately describes full tiles only.
-            // For aligned non-paged metadata, the merged block IDs are sorted
-            // and unique, so their endpoint distance also proves a partial
-            // tile contiguous without changing the FP4 metadata contract.
-            bool is_contiguous = num_blocks == kNumKVBlocksPerSplit &&
-                SML::KVSplitHeader::is_contiguous(packed_count);
-            if (num_blocks > 0 && num_blocks < kNumKVBlocksPerSplit && !use_unaligned_ks) {
-                const uint32_t last = deep_gemm::tix::ld_shared_u32(
-                    &split.kv_block_infos[num_blocks - 1].physical_kv_block_idx);
-                is_contiguous = last == first + (num_blocks - 1) * SPARSE_BLOCK_KV;
+            bool is_contiguous;
+            if constexpr (kIsPaged) {
+                constexpr uint32_t kBlocksPerPage = PAGE_KV / SPARSE_BLOCK_KV;
+                const bool contiguous_hint = SML::KVSplitHeader::is_contiguous(packed_count);
+                // A metadata hint proves contiguous blocks in one logical page.
+                // Without it, retain the physical-block vote for older metadata
+                // and aliases across logical pages. Both paths must stay within
+                // one physical page, excluding its scale region and stride gap.
+                is_contiguous = false;
+                if (num_blocks > 0 && first % kBlocksPerPage + num_blocks <= kBlocksPerPage &&
+                    static_cast<uint64_t>(first) * SPARSE_BLOCK_KV < params.num_kv_tokens) {
+                    is_contiguous = contiguous_hint;
+                    if (!contiguous_hint) {
+                        // Every warp independently evaluates the same live blocks.
+                        bool consecutive = true;
+                        if (lane_idx < num_blocks)
+                            consecutive = deep_gemm::tix::ld_shared_u32(
+                                &split.kv_block_infos[lane_idx].physical_kv_block_idx) == first + lane_idx;
+                        is_contiguous = __all_sync(0xffffffffu, consecutive);
+                    }
+                }
+            } else {
+                // The metadata flag describes full tiles only. Aligned merged
+                // non-paged IDs are sorted and unique, so endpoint distance
+                // also proves contiguity for a partial tile.
+                is_contiguous = num_blocks == kNumKVBlocksPerSplit &&
+                    SML::KVSplitHeader::is_contiguous(packed_count);
+                if (num_blocks > 0 && num_blocks < kNumKVBlocksPerSplit && !use_unaligned_ks) {
+                    const uint32_t last = deep_gemm::tix::ld_shared_u32(
+                        &split.kv_block_infos[num_blocks - 1].physical_kv_block_idx);
+                    is_contiguous = last == first + (num_blocks - 1) * SPARSE_BLOCK_KV;
+                }
+                is_contiguous = is_contiguous && first < params.num_kv_tokens;
             }
-            is_contiguous = is_contiguous && first < params.num_kv_tokens;
             if (is_contiguous) {
                 if (thread_idx == 0) {
-                    contiguous_desc.dim_h = min(num_blocks * SPARSE_BLOCK_KV, params.num_kv_tokens - first);
+                    if constexpr (kIsPaged)
+                        contiguous_desc.dim_h = num_blocks * SPARSE_BLOCK_KV;
+                    else
+                        contiguous_desc.dim_h = min(num_blocks * SPARSE_BLOCK_KV, params.num_kv_tokens - first);
                     ContiguousAiuCopy::copy(storage.smem_k.data() + stage * kStageBytes,
-                        params.ptr_k + static_cast<uint64_t>(first) * BLOCK_K, contiguous_desc, 0, 0, 0);
+                        resolve_k(first, 0), contiguous_desc, 0, 0, 0);
                 }
             } else {
 #if __HGGC_ARCH__ == 100
@@ -253,11 +326,13 @@ public:
                     const uint32_t physical = b < num_blocks ?
                         deep_gemm::tix::ld_shared_u32(&split.kv_block_infos[b].physical_kv_block_idx) :
                         params.num_kv_tokens;
-                    const uint64_t token = static_cast<uint64_t>(physical) + row % SPARSE_BLOCK_KV;
+                    const uint64_t token = static_cast<uint64_t>(physical) * (kIsPaged ? SPARSE_BLOCK_KV : 1u) +
+                                           row % SPARSE_BLOCK_KV;
                     auto* dst = reinterpret_cast<uint4*>(storage.smem_k.data() + stage * kStageBytes +
                                                         ppu0010_kv_vector_offset(row, channel));
                     if (token < params.num_kv_tokens) {
-                        const auto* src = reinterpret_cast<const uint4*>(params.ptr_k + token * BLOCK_K + channel);
+                        const auto* src = reinterpret_cast<const uint4*>(
+                            resolve_k(physical, row % SPARSE_BLOCK_KV) + channel);
                         PPU_CP_ASYNC_CACHEALWAYS<uint4>::copy(*src, *dst);
                     } else {
                         // No input padding or out-of-bounds source address is needed.
@@ -271,12 +346,13 @@ public:
                         if (b < num_blocks) {
                             const uint32_t physical = deep_gemm::tix::ld_shared_u32(
                                 &split.kv_block_infos[b].physical_kv_block_idx);
-                            if (physical < params.num_kv_tokens) {
+                            const uint64_t token = static_cast<uint64_t>(physical) * (kIsPaged ? SPARSE_BLOCK_KV : 1u);
+                            if (token < params.num_kv_tokens) {
                                 // Bound the descriptor by the real allocation, including an
                                 // unaligned block or a final block shorter than 8/16 tokens.
-                                gather_desc.dim_h = min(SPARSE_BLOCK_KV, params.num_kv_tokens - physical);
+                                gather_desc.dim_h = min(SPARSE_BLOCK_KV, params.num_kv_tokens - static_cast<uint32_t>(token));
                                 GatherAiuCopy::copy(storage.smem_k.data() + stage * kStageBytes + b * kChunkBytes,
-                                    params.ptr_k + static_cast<uint64_t>(physical) * BLOCK_K,
+                                    resolve_k(physical, 0),
                                     gather_desc, 0, 0, 0);
                             }
                         }
@@ -284,17 +360,47 @@ public:
                 }
 #endif
             }
+            if constexpr (kIsPaged) {
+                if (is_contiguous) {
+                    // The contiguous path stays inside one physical page, so
+                    // every live row uses the same scale base without reloading
+                    // its block's physical index or resolving its page again.
+                    if (thread_idx < BLOCK_M) {
+                        const uint32_t row = thread_idx;
+                        const float* scale_base = resolve_scale(first, 0);
+                        auto& scale_dst = storage.smem_k_scales[SmemLayoutSFA{}(0, row, stage)];
+                        if (row / SPARSE_BLOCK_KV < num_blocks &&
+                            static_cast<uint64_t>(first) * SPARSE_BLOCK_KV + row < params.num_kv_tokens) {
+                            PPU_CP_ASYNC_CACHEALWAYS<float>::copy(scale_base[row], scale_dst);
+                        } else {
+                            scale_dst = 0.0f;
+                        }
+                    }
+                    // Only exit this loader; the caller still commits and waits
+                    // for the shared K/scale group before the CTA barrier.
+                    return;
+                }
+            }
             if (thread_idx < BLOCK_M) {
                 const uint32_t row = thread_idx;
                 const uint32_t b = row / SPARSE_BLOCK_KV;
                 const uint32_t physical = b < num_blocks ?
                     deep_gemm::tix::ld_shared_u32(&split.kv_block_infos[b].physical_kv_block_idx) :
                     params.num_kv_tokens;
-                const uint64_t token = static_cast<uint64_t>(physical) + row % SPARSE_BLOCK_KV;
-                storage.smem_k_scales[SmemLayoutSFA{}(0, row, stage)] =
-                    token < params.num_kv_tokens ? __ldg(params.k_scales + token) : 0.0f;
+                const uint64_t token = static_cast<uint64_t>(physical) * (kIsPaged ? SPARSE_BLOCK_KV : 1u) +
+                                       row % SPARSE_BLOCK_KV;
+                auto& scale_dst = storage.smem_k_scales[SmemLayoutSFA{}(0, row, stage)];
+                if (token < params.num_kv_tokens) {
+                    // A 4-byte copy joins this KV stage's existing async group.
+                    // The consumer's wait<1> + CTA barrier publishes both K and scales.
+                    PPU_CP_ASYNC_CACHEALWAYS<float>::copy(*resolve_scale(physical, row % SPARSE_BLOCK_KV), scale_dst);
+                } else {
+                    // Keep invalid tails independent of input padding/address validity.
+                    scale_dst = 0.0f;
+                }
 #if __HGGC_ARCH__ != 100
-                if (!is_contiguous && physical >= params.num_kv_tokens) {
+                if (!is_contiguous &&
+                    static_cast<uint64_t>(physical) * (kIsPaged ? SPARSE_BLOCK_KV : 1u) >= params.num_kv_tokens) {
                     // Entire unused blocks are zeroed in their physical smem region.
                     // Blocks span whole 8-row swizzle groups, so these writes never
                     // overlap a live block's AIU writes. Partial live blocks use padz.
@@ -372,7 +478,7 @@ public:
             const uint32_t valid_q = min(entry.num_q_tokens, params.num_q_tokens - entry.q_token_base);
             const uint32_t num_splits = entry.kv_split_end - entry.kv_split_begin;
             CUTE_UNROLL
-            for (uint32_t pipe = 0; pipe < kNumKVStages; ++pipe) {
+            for (uint32_t pipe = 0; pipe < kMetadataPrefetchDistance; ++pipe) {
                 if (pipe < num_splits)
                     load_metadata(entry.kv_split_begin + pipe, pipe);
             }
@@ -396,21 +502,23 @@ public:
                 const uint32_t next = split + kNumKVStages - 1;
                 if (next < num_splits)
                     load_kv(next % kNumMetadataStages, next % kNumKVStages);
-                const uint32_t next_metadata = split + kNumKVStages;
+                const uint32_t next_metadata = split + kMetadataPrefetchDistance;
                 if (next_metadata < num_splits)
-                    load_metadata(entry.kv_split_begin + next_metadata, next_metadata % kNumMetadataStages);
+                    load_metadata_async(entry.kv_split_begin + next_metadata, next_metadata % kNumMetadataStages);
                 cp_async_fence();
                 copy(smem_tiled_copy_A, tCsA(_, _, _, stage), tCrA_copy_view);
                 cute::gemm(tiled_mma, accum, tCrA, tCrB, accum);
                 epilogue(split % kNumMetadataStages, stage, entry, valid_q);
                 cp_async_wait<kNumKVStages - 2>();
-                // Publishes the next stage and retires every reader before a stage
-                // is reused. This first INT8 implementation has no warp interleave.
+                // Publishes completed K/scale/metadata copies and retires shared
+                // readers before any stage or metadata slot is reused.
                 __syncthreads();
                 clear(accum);
             }
-            cp_async_wait<0>();
-            __syncthreads();
+            // The last iteration issues neither future KV/scales nor metadata.
+            // Its empty commit is the only group that wait<1> may leave pending;
+            // every real copy and shared-memory user has passed the CTA barrier.
+            // No additional drain/barrier is required before the next entry.
         }
     }
 };

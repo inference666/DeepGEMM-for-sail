@@ -524,27 +524,49 @@ torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_s
 // Paged counterpart: KV windows are [0, context_lens[q]) per token; the physical location of a
 // selected logical block resolves through `block_table` (one row per Q token). `indices[q]` is
 // the request id of token q — Q blocks (kBlockQ = 2) only pair tokens of the same request. No
-// unaligned-ks support (pages are whole sparse blocks by construction).
+// unaligned-ks support (pages are whole sparse blocks by construction). Paired tokens must
+// share the same page mapping; the merge resolves their blocks using the first token's row.
 torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_lens,
                                                    const torch::Tensor& block_table,
                                                    const torch::Tensor& indices, int page_kv,
                                                    const torch::Tensor& sparse_kv_block_indices,
                                                    torch::ScalarType qk_dtype, int sparse_block_kv) {
-    check_indexer_arch(torch::kInt8, true);
+    TORCH_CHECK(context_lens.is_cuda() and context_lens.scalar_type() == torch::kInt32 and
+                context_lens.is_contiguous() and context_lens.dim() == 1,
+                "context_lens must be a contiguous one-dimensional int32 device tensor");
+    TORCH_CHECK(context_lens.size(0) > 0 and context_lens.size(0) <= (1 << 20),
+                "num_q_tokens must be in [1, 1048576], matching the sparse metadata workspace");
     const int num_q_tokens = static_cast<int>(context_lens.size(0));
-    DG_HOST_ASSERT(num_q_tokens > 0 and block_table.size(0) == num_q_tokens and indices.size(0) == num_q_tokens);
-    DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt32 and context_lens.is_contiguous());
-    DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt32 and block_table.is_contiguous() and
-                   block_table.dim() == 2);
-    DG_HOST_ASSERT(indices.scalar_type() == torch::kInt32 and indices.is_contiguous());
-    DG_HOST_ASSERT(sparse_kv_block_indices.dim() == 2 and sparse_kv_block_indices.size(0) == num_q_tokens);
-    DG_HOST_ASSERT(sparse_kv_block_indices.scalar_type() == torch::kInt32 and sparse_kv_block_indices.is_contiguous());
-    DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
-    DG_HOST_ASSERT(page_kv > 0 and page_kv % sparse_block_kv == 0);
-    sparse_mqa_logits::get_sparse_split_kv(qk_dtype);  // MXFP4 only.
+    TORCH_CHECK(block_table.scalar_type() == torch::kInt32 and block_table.is_contiguous() and
+                block_table.dim() == 2 and block_table.size(0) == num_q_tokens and block_table.size(1) > 0,
+                "block_table must be contiguous int32 with shape [num_q_tokens, max_pages], max_pages > 0");
+    TORCH_CHECK(block_table.stride(0) > 0 and
+                block_table.stride(0) <= std::numeric_limits<uint32_t>::max(),
+                "block_table row stride must fit uint32");
+    TORCH_CHECK(indices.scalar_type() == torch::kInt32 and indices.is_contiguous() and
+                indices.dim() == 1 and indices.size(0) == num_q_tokens,
+                "indices must be contiguous int32 request IDs with shape [num_q_tokens]");
+    TORCH_CHECK(sparse_kv_block_indices.scalar_type() == torch::kInt32 and
+                sparse_kv_block_indices.is_contiguous() and sparse_kv_block_indices.dim() == 2 and
+                sparse_kv_block_indices.size(0) == num_q_tokens,
+                "sparse_kv_block_indices must be contiguous int32 with shape [num_q_tokens, max_sparse_blocks]");
+    TORCH_CHECK(block_table.device() == context_lens.device() and indices.device() == context_lens.device() and
+                sparse_kv_block_indices.device() == context_lens.device(),
+                "context_lens, block_table, indices and sparse_kv_block_indices must be on the same device");
+    TORCH_CHECK(sparse_block_kv == 8 or sparse_block_kv == 16, "sparse_block_kv must be 8 or 16");
+    TORCH_CHECK(page_kv > 0 and page_kv % sparse_block_kv == 0,
+                "page_kv must be positive and divisible by sparse_block_kv");
+    TORCH_CHECK(qk_dtype == torch::kInt8, "paged sparse metadata requires torch.int8 for packed MXFP4 or INT8");
+    TORCH_CHECK(sparse_kv_block_indices.size(1) > 0 and sparse_kv_block_indices.size(1) % 4 == 0 and
+                sparse_kv_block_indices.size(1) <= 4096,
+                "num_max_sparse_blocks must be a positive multiple of 4, at most 4096");
+    const c10::cuda::CUDAGuard guard(context_lens.device());
+    sparse_mqa_logits::get_sparse_split_kv(qk_dtype);  // Packed MXFP4 and INT8 share this metadata layout.
     const int num_max_sparse_blocks = static_cast<int>(sparse_kv_block_indices.size(1));
+    const int num_slots = sparse_mqa_logits::get_num_sparse_slots();
+    TORCH_CHECK(num_slots > 0, "sparse metadata requires a positive schedule slot count");
     const int64_t num_metadata_bytes = sparse_mqa_logits::get_num_sparse_metadata_bytes(
-        num_q_tokens, num_max_sparse_blocks, sparse_block_kv, sparse_mqa_logits::get_num_sparse_slots(),
+        num_q_tokens, num_max_sparse_blocks, sparse_block_kv, num_slots,
         /*is_paged=*/true);
     auto metadata = torch::empty({num_metadata_bytes},
                                  sparse_kv_block_indices.options().dtype(torch::kUInt8));
@@ -674,9 +696,76 @@ torch::Tensor int8_sparse_mqa_logits(const torch::Tensor& q,
     return logits;
 }
 
+// Native paged INT8 storage uses a uint8 container of shape [pages, page_kv, 1, 132].
+// Each page is SoA: page_kv * 128 signed K bytes, then page_kv float32 K scales.
+// Q scales are already folded into BF16 weights. The scale values must be positive and
+// finite; their device contents are not inspected here. Metadata must come from the paged
+// builder with matching page/block/slot settings. Invalid slots and row padding are unspecified.
+torch::Tensor int8_paged_sparse_mqa_logits(const torch::Tensor& q, const torch::Tensor& kv_cache,
+                                           const torch::Tensor& weights, const torch::Tensor& metadata,
+                                           int num_max_sparse_blocks, int sparse_block_kv) {
+    TORCH_CHECK(q.is_cuda() and q.scalar_type() == torch::kInt8 and q.is_contiguous(),
+                "q must be a contiguous INT8 device tensor");
+    TORCH_CHECK(q.dim() == 4 and q.size(1) == 1 and q.size(2) == sparse_mqa_logits::kNumHeads and
+                q.size(3) == sparse_mqa_logits::kHeadDim,
+                "q must have shape [num_q_tokens, 1, 32, 128]");
+    TORCH_CHECK(q.size(0) > 0 and q.size(0) <= (1 << 20),
+                "num_q_tokens must be in [1, 1048576], matching the sparse metadata workspace");
+    constexpr int64_t kTokenBytes = sparse_mqa_logits::kHeadDim + sizeof(float);
+    TORCH_CHECK(kv_cache.scalar_type() == torch::kUInt8 and kv_cache.dim() == 4 and
+                kv_cache.size(0) > 0 and kv_cache.size(2) == 1 and kv_cache.size(3) == kTokenBytes,
+                "kv_cache must be uint8 with shape [num_pages, page_kv, 1, 132]");
+    TORCH_CHECK(sparse_block_kv == 8 or sparse_block_kv == 16, "sparse_block_kv must be 8 or 16");
+    const int64_t page_kv = kv_cache.size(1);
+    TORCH_CHECK(page_kv > 0 and page_kv <= std::numeric_limits<int>::max() and page_kv % sparse_block_kv == 0,
+                "page_kv must be positive, fit int32 and be divisible by sparse_block_kv");
+    TORCH_CHECK(kv_cache.stride(1) == kTokenBytes and kv_cache.stride(3) == 1 and
+                kv_cache.stride(0) >= page_kv * kTokenBytes and kv_cache.stride(0) % 512 == 0 and
+                kv_cache.stride(0) <= std::numeric_limits<uint32_t>::max(),
+                "kv_cache must use contiguous page contents and a non-overlapping, 512-byte-aligned uint32 page stride");
+    TORCH_CHECK(kv_cache.size(0) <= std::numeric_limits<uint32_t>::max() / page_kv,
+                "num_pages * page_kv must fit uint32");
+    const uint32_t num_kv_tokens = static_cast<uint32_t>(kv_cache.size(0) * page_kv);
+    TORCH_CHECK(weights.scalar_type() == torch::kBFloat16 and weights.is_contiguous() and weights.dim() == 2 and
+                weights.size(0) == q.size(0) and weights.size(1) == sparse_mqa_logits::kNumHeads,
+                "weights must be contiguous bfloat16 with shape [num_q_tokens, 32]");
+    TORCH_CHECK(metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous() and metadata.dim() == 1,
+                "metadata must be a contiguous one-dimensional uint8 tensor");
+    TORCH_CHECK(kv_cache.device() == q.device() and weights.device() == q.device() and metadata.device() == q.device(),
+                "q, kv_cache, weights and metadata must be on the same device");
+    TORCH_CHECK(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096,
+                "num_max_sparse_blocks must be a positive multiple of 4, at most 4096");
+
+    const c10::cuda::CUDAGuard guard(q.device());
+    const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
+    TORCH_CHECK(arch_major == 8 and arch_minor == 0,
+                "INT8 paged sparse MQA requires PPU0010 (device capability 8.0)");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0 and
+                reinterpret_cast<uintptr_t>(kv_cache.data_ptr()) % 16 == 0 and
+                reinterpret_cast<uintptr_t>(weights.data_ptr()) % 16 == 0 and
+                reinterpret_cast<uintptr_t>(metadata.data_ptr()) % 16 == 0,
+                "q, kv_cache, weights and metadata base addresses must be 16-byte aligned");
+    const int num_q_tokens = static_cast<int>(q.size(0));
+    const int num_slots = sparse_mqa_logits::get_num_sparse_slots();
+    TORCH_CHECK(num_slots > 0 and num_slots <= 256, "sparse metadata requires 1 to 256 schedule slots");
+    const int64_t num_metadata_bytes = sparse_mqa_logits::get_num_sparse_metadata_bytes(
+        num_q_tokens, num_max_sparse_blocks, sparse_block_kv, num_slots, /*is_paged=*/true);
+    TORCH_CHECK(metadata.numel() >= num_metadata_bytes,
+                "metadata is smaller than the buffer produced for these paged sparse dimensions");
+    // Only host tensor descriptors are checked: do not read the device header or synchronize.
+    const int logits_stride = align(num_max_sparse_blocks * sparse_block_kv, 512);
+    auto logits = torch::empty({align(num_q_tokens, static_cast<int>(sparse_mqa_logits::kBlockQ)), logits_stride},
+                               q.options().dtype(torch::kBFloat16)).slice(0, 0, num_q_tokens);
+    sparse_mqa_logits::launch_int8_paged_sparse_mqa_logits(
+        q, kv_cache, weights, metadata, logits, static_cast<uint32_t>(logits_stride),
+        static_cast<uint32_t>(sparse_block_kv), static_cast<uint32_t>(num_q_tokens),
+        num_kv_tokens, static_cast<uint32_t>(num_max_sparse_blocks));
+    return logits;
+}
+
 // Paged counterpart of `fp8_fp4_sparse_mqa_logits`: `kv_cache` is the fused fp4 cache viewed as
-// `[num_pages, page_kv, 1, head_dim/2 + 4]` uint8 (each packed 64B token row trails a 4B SF
-// u32), with 512B-aligned page stride. Consumes the metadata built by
+// `[num_pages, page_kv, 1, head_dim/2 + 4]` uint8. Each physical page contains all packed K rows,
+// then all 4B scale words, with 512B-aligned page stride. Consumes the metadata built by
 // `get_paged_sparse_mqa_logits_metadata`.
 torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::pair<torch::Tensor, torch::Tensor>& q,
                                               const torch::Tensor& kv_cache, const torch::Tensor& weights_input,
@@ -756,6 +845,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("context_lens"), py::arg("block_table"), py::arg("indices"), py::arg("page_kv"),
           py::arg("sparse_kv_block_indices"), py::arg("qk_dtype"), py::arg("sparse_block_kv"));
     m.def("fp8_fp4_paged_sparse_mqa_logits", &fp8_fp4_paged_sparse_mqa_logits,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"), py::arg("metadata"),
+          py::arg("num_max_sparse_blocks"), py::arg("sparse_block_kv"));
+    m.def("int8_paged_sparse_mqa_logits", &int8_paged_sparse_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"), py::arg("metadata"),
           py::arg("num_max_sparse_blocks"), py::arg("sparse_block_kv"));
     m.def("fp8_fp4_mqa_avg_logits", &fp8_fp4_mqa_avg_logits, py::arg("q"), py::arg("kv"),

@@ -132,6 +132,7 @@ from ._C import (
     int8_sparse_mqa_logits,
     get_paged_sparse_mqa_logits_metadata,
     fp8_fp4_paged_sparse_mqa_logits,
+    int8_paged_sparse_mqa_logits,
 )
 
 from ._C import epilogue

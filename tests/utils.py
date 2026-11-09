@@ -2756,17 +2756,21 @@ def ref_int8_sparse_mqa_logits(q: torch.Tensor, kv_gathered: torch.Tensor,
 
 # Layout mirrors deep_gemm/include/deep_gemm/impls/sparse_mqa_logits_layout.cuh
 SPARSE_SPLIT_KV = 128
-SPARSE_CTAS_PER_CU = 7
 SPARSE_INVALID_SLOT = 0xFFFF
 SPARSE_CONTIGUOUS_FLAG = 0x80000000
 # KVBlockInfo slot fields are raw 16-bit offsets (no present bit; the present bit only exists in
 # the metadata kernel's shared-memory merge packing, which is never written out)
 SPARSE_SLOT_MASK = 0xFFFF
 
+def get_sparse_num_slots() -> int:
+    """Mirror the host's architecture-specific persistent schedule column count."""
+    slots_per_cu = 4 if get_arch_version() == 80 else 7
+    return slots_per_cu * deep_gemm.get_num_sms()
+
 def decode_sparse_metadata(metadata: torch.Tensor, sparse_block_kv: int) -> dict:
     """Decode the metadata buffer produced by the sparse metadata kernel (contiguous layout)."""
-    # Schedule table columns = resident CTAs of the sparse main kernel = num_cu x tb_per_cu
-    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
+    # One schedule column per launched persistent CTA; this is not measured residency.
+    num_slots = get_sparse_num_slots()
     words = metadata.view(torch.int32).cpu().numpy()
     num_kv_splits, num_waves, use_unaligned_ks = int(words[0]), int(words[1]), int(words[2])
     blocks_per_split = SPARSE_SPLIT_KV // sparse_block_kv
@@ -2859,7 +2863,7 @@ def verify_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int) -> Non
     """Compare the kernel's decoded metadata against the Python reference. Split reservation order
     is nondeterministic, so split lists are canonically sorted by (q_token_base, q0_slot_base,
     q1_slot_base); the schedule is validated structurally (exact tiling, slot evenness, Q-block cuts)."""
-    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
+    num_slots = get_sparse_num_slots()
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
         print(f"ERROR: metadata num_kv_splits mismatch: {decoded['num_kv_splits']} vs {ref['num_kv_splits']}")
         exit(1)
@@ -2923,6 +2927,10 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
     KV window = [0, context_lens[q]) per token (logical values are raw block ids), Q blocks pair
     only tokens of the same request (from the request start), and physical =
     block_table[q_token_base][logical // blocks_per_page] * blocks_per_page + logical % blocks_per_page.
+    PPU1.0 marks a split contiguous only if every logical block is consecutive
+    and belongs to one logical page, including partial splits. PPU1.5 keeps
+    the flag false. Check the full logical sequence independently of the
+    kernel's endpoint proof; aliased physical endpoints alone prove nothing.
     Split reservation order is nondeterministic (atomic); callers compare via canonical sorting."""
     blocks_per_split = SPARSE_SPLIT_KV // sparse_block_kv
     blocks_per_page = page_kv // sparse_block_kv
@@ -2934,10 +2942,11 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
     # Per-token pairing: base t pairs with t+1 iff t is request-aligned and t+1 is the same request
     paired = [False] * num_q_tokens
     q_token_bases = []
+    r_start = 0
     for t in range(num_q_tokens):
-        r_start = t
-        while r_start > 0 and req[r_start - 1] == req[t]:
-            r_start -= 1
+        # Linear scan of contiguous runs: an ID may reappear after another ID.
+        if t == 0 or req[t - 1] != req[t]:
+            r_start = t
         if (t - r_start) % 2 != 0:
             continue
         q_token_bases.append(t)
@@ -2968,6 +2977,12 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
         for split_offset in range(num_splits):
             blocks_in_split = merged[split_offset * blocks_per_split:(split_offset + 1) * blocks_per_split]
             q0_slot_base, q1_slot_base = blocks_in_split[0][1], blocks_in_split[0][2]
+            logical_ids = [block[0] for block in blocks_in_split]
+            is_contiguous = (get_arch_version() == 80 and
+                             all(logical == logical_ids[0] + offset
+                                 for offset, logical in enumerate(logical_ids)) and
+                             all(logical // blocks_per_page == logical_ids[0] // blocks_per_page
+                                 for logical in logical_ids))
             block_records = []
             for logical, i0, i1, in_q0, in_q1 in blocks_in_split:
                 logical_page_idx = logical // blocks_per_page
@@ -2977,16 +2992,21 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
                 block_records.append((physical, q0_off, q1_off))
             block_records += [(0, SPARSE_INVALID_SLOT, SPARSE_INVALID_SLOT)] * (blocks_per_split - len(block_records))
             splits.append(dict(q_token_base=q_token_base, num_kv_blocks=len(blocks_in_split),
-                               is_contiguous=False, q0_slot_base=q0_slot_base,
+                               is_contiguous=is_contiguous, q0_slot_base=q0_slot_base,
                                q1_slot_base=q1_slot_base if paired[q_token_base] else SPARSE_INVALID_SLOT,
                                blocks=block_records))
     return dict(num_kv_splits=len(splits), splits=splits, use_unaligned_ks=0)
 
 def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                                  request_ids: torch.Tensor) -> None:
-    """Paged schedule check: entries tile [0, num_kv_splits) exactly; each entry stays inside its
-    Q block's split range with a pairing count matching the request-aligned pairs."""
-    num_slots = SPARSE_CTAS_PER_CU * deep_gemm.get_num_sms()
+    """Check every split plus the architecture's exact paged schedule policy.
+
+    PPU1.0 divides reserved split indices evenly among slots, cutting each
+    slot's interval only at request-local Q-pair boundaries. PPU1.5 keeps
+    bounded-eight entries and stable wave balancing. Reservation order is
+    nondeterministic, so both policies use the actual decoded split order.
+    """
+    num_slots = get_sparse_num_slots()
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
         print(f"ERROR: metadata num_kv_splits mismatch: {decoded['num_kv_splits']} vs {ref['num_kv_splits']}")
         exit(1)
@@ -3005,17 +3025,30 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                     exit(1)
             print("ERROR: metadata blocks mismatch (no differing block found?!)")
             exit(1)
-    # Paged schedule: entries (any slot order, balanced across waves) must tile the split space.
+    # Both paged schedules must tile the split space exactly.
     # Schedule entries carry *kernel* split indices, so Q-block ranges come from the decoded
     # splits in kernel order (one base's range is contiguous — a CTA reserves it atomically).
     req = request_ids.cpu().numpy().tolist()
+    run_begins, run_begin = [], 0
+    for index in range(total_q_tokens):
+        if index == 0 or req[index - 1] != req[index]:
+            run_begin = index
+        run_begins.append(run_begin)
     base_ranges, base_pairing = {}, {}
     for idx, s in enumerate(decoded['splits']):
         b = s['q_token_base']
+        assert 0 <= b < total_q_tokens and (b - run_begins[b]) % 2 == 0
+        expected_pairing = 2 if (b + 1 < total_q_tokens and req[b + 1] == req[b]) else 1
+        header_pairing = 1 + int(s['q1_slot_base'] != SPARSE_INVALID_SLOT)
+        # A paired Q1 with context=0 still has valid_q=2. Conversely, an
+        # unpaired Q0 followed by a different request must keep valid_q=1.
+        assert header_pairing == expected_pairing, (b, header_pairing, expected_pairing)
         if b not in base_ranges:
             base_ranges[b] = [idx, idx + 1]
-            base_pairing[b] = 2 if (b + 1 < total_q_tokens and req[b + 1] == req[b]) else 1
+            base_pairing[b] = header_pairing
         else:
+            assert base_ranges[b][1] == idx, f'Q pair {b} has noncontiguous split reservation'
+            assert base_pairing[b] == header_pairing
             base_ranges[b][1] = idx + 1
     total = ref['num_kv_splits']
     num_waves = decoded['num_waves']
@@ -3048,6 +3081,29 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
     if expect_begin != total:
         print(f"ERROR: paged schedule covers [0,{expect_begin}) but total splits = {total}")
         exit(1)
+
+    if get_arch_version() == 80:
+        per_slot = []
+        for slot in range(num_slots):
+            begin = ceil_div(total * slot, num_slots)
+            limit = ceil_div(total * (slot + 1), num_slots)
+            entries = []
+            while begin < limit:
+                base = decoded['splits'][begin]['q_token_base']
+                end = min(limit, base_ranges[base][1])
+                assert begin < end
+                entries.append((begin, end, base, base_pairing[base]))
+                begin = end
+            per_slot.append(entries)
+        expected_waves = max(1, max(map(len, per_slot)))
+        assert num_waves == expected_waves, (num_waves, expected_waves)
+        for wave in range(expected_waves):
+            for slot, entries in enumerate(per_slot):
+                expected = entries[wave] if wave < len(entries) else (0, 0, 0, 0)
+                actual = tuple(decoded['schedule'][wave * num_slots + slot])
+                assert actual == expected, (f'Paged split-window mismatch at wave {wave}, slot {slot}: '
+                                            f'{actual} vs {expected}')
+        return
 
     # Verify the stable wave ordering, not only coverage: equal-sized entries
     # retain Q order, and rotation (including the reversed two-wave tail) is exact.
@@ -3140,9 +3196,257 @@ def check_fp4_sparse_prefix_reference_chunks(q, kv, weights, logits, request_siz
     return checked_positions
 
 
+def pack_int8_sparse_paged_cache(k: torch.Tensor, scales: torch.Tensor,
+                                  extra_page_padding: int = 0) -> torch.Tensor:
+    """Pack physical pages as [all K bytes][all FP32 scales], with poisoned stride padding.
+
+    The API's [pages, page_kv, 1, 132] shape describes storage, not 132-byte
+    token records. In particular, assigning cache[..., :128] would create AoS
+    and is incorrect for the native paged INT8 kernels.
+    """
+    assert k.dtype == torch.int8 and k.ndim == 3 and k.size(2) == 128
+    assert scales.dtype == torch.float32 and scales.shape == k.shape[:2]
+    assert scales.device == k.device and extra_page_padding >= 0 and extra_page_padding % 512 == 0
+    pages, page_kv, _ = k.shape
+    stride = round_up(page_kv * 132, 512) + extra_page_padding
+    storage = torch.full((pages, stride), 0xA5, device=k.device, dtype=torch.uint8)
+    storage[:, :page_kv * 128].copy_(k.contiguous().view(torch.uint8).reshape(pages, -1))
+    storage[:, page_kv * 128:page_kv * 132].copy_(scales.contiguous().view(torch.uint8).reshape(pages, -1))
+    return storage.as_strided((pages, page_kv, 1, 132), (stride, 132, 132, 1))
+
+
+def unpack_int8_sparse_paged_cache(cache: torch.Tensor):
+    """Independent views of the represented SoA K/scales, respecting physical page stride."""
+    assert cache.dtype == torch.uint8 and cache.ndim == 4 and tuple(cache.shape[2:]) == (1, 132)
+    pages, page_kv = cache.shape[:2]
+    payload = cache.as_strided((pages, page_kv * 132), (cache.stride(0), 1))
+    k = payload[:, :page_kv * 128].view(pages, page_kv, 128).view(torch.int8)
+    scales = payload[:, page_kv * 128:].view(torch.float32).view(pages, page_kv)
+    return k, scales
+
+
+def check_int8_paged_sparse_reference_chunks(q, kv_cache, weights, logits, context_lens,
+                                             block_table, sparse_indices, num_blocks_per_q,
+                                             sparse_block_kv, chunk_size=16):
+    """Selected-page gather plus independent exact BF16 reference, bounded in Q.
+
+    The reference follows each Q row's logical sparse IDs through its page
+    table. Valid logical IDs follow the API's strictly increasing, unique-prefix
+    contract; different logical pages may share physical pages. Padding slots
+    are ignored. The reference never reads kernel metadata or calls a sparse/
+    dense MQA kernel to form expected values.
+    """
+    assert isinstance(chunk_size, int) and chunk_size > 0
+    assert q.ndim == 4 and tuple(q.shape[1:]) == (1, 32, 128)
+    k, scales = unpack_int8_sparse_paged_cache(kv_cache)
+    page_kv, checked = kv_cache.size(1), 0
+    for begin in range(0, q.size(0), chunk_size):
+        end = min(begin + chunk_size, q.size(0))
+        blocks = max(num_blocks_per_q[begin:end])
+        if blocks == 0:
+            continue
+        tokens = (sparse_indices[begin:end, :blocks].long().unsqueeze(-1) * sparse_block_kv
+                  + torch.arange(sparse_block_kv, device=q.device)).flatten(1)
+        counts = torch.tensor(num_blocks_per_q[begin:end], device=q.device)
+        valid = torch.arange(tokens.size(1), device=q.device)[None, :] < counts[:, None] * sparse_block_kv
+        valid &= (tokens >= 0) & (tokens < context_lens[begin:end, None])
+        # Only invalid output slots may be clamped. Valid selected tokens must
+        # resolve through their actual logical page, with no global flat-K shortcut.
+        logical_pages = (tokens // page_kv).clamp(0, block_table.size(1) - 1)
+        physical_pages = block_table[begin:end].long().gather(1, logical_pages)
+        in_page = tokens.remainder(page_kv)
+        expected = ref_int8_sparse_mqa_logits(q[begin:end, 0], k[physical_pages, in_page],
+                                              scales[physical_pages, in_page], weights[begin:end])
+        torch.testing.assert_close(logits[begin:end, :tokens.size(1)][valid], expected[valid], rtol=0, atol=0,
+                                   msg=lambda message: f"INT8 paged sparse reference at Q rows [{begin}, {end}):\n{message}")
+        checked += int(valid.sum().item())
+    print(f"Independent paged chunked reference passed: rows={q.size(0)}, valid_positions={checked}, "
+          f"chunk_size={chunk_size}")
+    return checked
+
+
+def make_int8_paged_sparse_inputs(args):
+    """Return native paged test inputs, also usable for identical-input A/B timing.
+
+    Explicit workloads retain request-local causal lengths and prefix slots.
+    seq_len_kv keeps the source list's B-aligned flat-pool checksum; native
+    addressing uses a separate permuted physical page pool and request IDs.
+    No page-table flattening or conversion belongs inside kernel timing.
+    """
+    assert args['data_type'] == torch.int8
+    assert args.get('num_heads', 32) == 32 and args.get('head_dim', 128) == 128
+    block, cap, page = (args.get('sparse_block_kv', 16), args.get('num_max_sparse_blocks', 128),
+                        args.get('page_kv', 64))
+    assert block in (8, 16) and 0 < cap <= 4096 and cap % 4 == 0
+    assert page > 0 and page % block == 0 and not args.get('use_unaligned_ks', False)
+    torch.manual_seed(args.get('seed', 0))
+    explicit = 'request_q_lens' in args or 'request_kv_lens' in args
+    if explicit:
+        sizes, kv_lens = args['request_q_lens'], args['request_kv_lens']
+        assert isinstance(sizes, list) and isinstance(kv_lens, list) and len(sizes) == len(kv_lens) > 0
+        assert all(type(q) is int and type(k) is int and 0 < q <= k for q, k in zip(sizes, kv_lens))
+        ratio = args.get('compress_ratio', 1)
+        assert type(ratio) is int and ratio > 0 and args.get('index_pattern', 'prefix') == 'prefix'
+        lens, flat_end = [], 0
+        for size, length in zip(sizes, kv_lens):
+            lens.extend((length - size + 1 + j) // ratio for j in range(size))
+            flat_end = round_up(flat_end, block) + length // ratio
+        rows, source_kv = sum(sizes), max(1, flat_end)
+        assert args.get('seq_len_q', rows) == rows and args.get('seq_len_kv', source_kv) == source_kv
+    else:
+        rows, source_kv = args['seq_len_q'], args['seq_len_kv']
+        assert rows > 0 and source_kv >= 0
+        rng = random.Random(rows * 1000003 + source_kv + block)
+        requests = min(rng.randint(2, 4), rows)
+        ends = sorted(rng.sample(range(1, rows), requests - 1)) + [rows]
+        sizes = [end - begin for begin, end in zip([0] + ends, ends)]
+        lens = [source_kv + offset for offset in range(rows)]
+    request_list = [request for request, size in enumerate(sizes) for _ in range(size)]
+    request_pages, begin = [], 0
+    for size in sizes:
+        request_pages.append(ceil_div(max(lens[begin:begin + size]), page))
+        begin += size
+    total_pages, max_pages = max(1, sum(request_pages)), max(1, max(request_pages))
+    order = args.get('page_order', 'permuted')
+    assert order in ('permuted', 'identity')
+    pool = (torch.randperm(total_pages, device='cuda', dtype=torch.int32) if order == 'permuted'
+            else torch.arange(total_pages, device='cuda', dtype=torch.int32))
+    request_table = torch.zeros((len(sizes), max_pages), device='cuda', dtype=torch.int32)
+    begin = 0
+    for request, count in enumerate(request_pages):
+        request_table[request, :count] = pool[begin:begin + count]
+        begin += count
+    request_ids = torch.tensor(request_list, device='cuda', dtype=torch.int32)
+    block_table = request_table[request_ids.long()].contiguous()
+    context_lens = torch.tensor(lens, device='cuda', dtype=torch.int32)
+    q_bf16 = torch.randn((rows, 32, 128), device='cuda', dtype=torch.bfloat16)
+    weights = torch.randn((rows, 32), device='cuda', dtype=torch.bfloat16)
+    q, qscale = per_token_cast_to_int8(q_bf16.view(-1, 128))
+    q = q.view(rows, 1, 32, 128)
+    weights = weights * qscale.view(rows, 32).to(weights.dtype)
+    kv_bf16 = torch.randn((total_pages * page, 128), device='cuda', dtype=torch.bfloat16)
+    k, scales = per_token_cast_to_int8(kv_bf16)
+    cache = pack_int8_sparse_paged_cache(k.view(total_pages, page, 128), scales.view(total_pages, page),
+                                        args.get('extra_page_padding', 0))
+    if explicit:
+        counts = [min(cap, ceil_div(length, block)) for length in lens]
+        sparse_indices = torch.minimum(torch.arange(cap, device='cuda', dtype=torch.int32)[None, :],
+                                       (torch.tensor(counts, device='cuda', dtype=torch.int32)[:, None] - 1).clamp_min(0))
+    else:
+        sparse_indices, counts = make_sparse_kv_block_indices(context_lens, torch.zeros_like(context_lens),
+            block, cap, seed=rows + source_kv + block, request_indices=request_list)
+    print(f"Native paged workload: case_id={args.get('case_id', 'custom')}, rows={rows}, "
+          f"requests={len(sizes)}, page_kv={page}, physical_pages={total_pages}, page_order={order}, "
+          f"page_stride_bytes={cache.stride(0)}, source_flat_kv={source_kv}")
+    return dict(q=q, kv_cache=cache, weights=weights, context_lens=context_lens, block_table=block_table,
+                request_ids=request_ids, sparse_indices=sparse_indices, num_blocks_per_q=counts,
+                request_sizes=sizes, context_lens_list=lens, page_kv=page, sparse_block_kv=block,
+                num_max_sparse_blocks=cap, explicit_requests=explicit)
+
+
+def check_int8_paged_sparse_nonpaged(q, cache, weights, logits, context_lens, block_table,
+                                    request_ids, sparse_indices, counts, block, cap, check_dense=True):
+    """Small-case secondary cross-check with per-request flattened logical KV.
+
+    This is separate from the independent reference. Isolating requests before
+    a nonpaged call preserves request-local odd-Q pairing, unlike concatenating
+    all Q rows and accidentally pairing the end of one request with the next.
+    """
+    pages_k, pages_s = unpack_int8_sparse_paged_cache(cache)
+    requests, lengths = request_ids.cpu().tolist(), context_lens.cpu().tolist()
+    begin = 0
+    while begin < q.size(0):
+        end = begin + 1
+        while end < q.size(0) and requests[end] == requests[begin]:
+            end += 1
+        length = max(lengths[begin:end])
+        if length > 0:
+            pages = block_table[begin, :ceil_div(length, cache.size(1))].long()
+            k = pages_k[pages].reshape(-1, 128)[:length].contiguous()
+            scales = pages_s[pages].reshape(-1)[:length].contiguous()
+            starts = torch.zeros_like(context_lens[begin:end])
+            ends = context_lens[begin:end]
+            indices = sparse_indices[begin:end]
+            metadata = deep_gemm.get_sparse_mqa_logits_metadata(starts, ends, length, indices, torch.int8, block)
+            reference = deep_gemm.int8_sparse_mqa_logits(q[begin:end, 0], (k, scales), weights[begin:end],
+                                                        metadata, cap, block)
+            tokens = (indices.long().unsqueeze(-1) * block + torch.arange(block, device=q.device)).flatten(1)
+            valid = torch.arange(cap * block, device=q.device)[None, :] < torch.tensor(counts[begin:end], device=q.device)[:, None] * block
+            valid &= tokens < ends[:, None]
+            torch.testing.assert_close(logits[begin:end, :cap * block][valid], reference[:, :cap * block][valid], rtol=0, atol=0)
+            if check_dense:
+                dense = deep_gemm.int8_mqa_logits(q[begin:end, 0], (k, scales), weights[begin:end], starts, ends,
+                                                 clean_logits=False, max_seqlen_k=length, logits_dtype=torch.bfloat16)
+                gathered, dense_valid = gather_sparse_reference(dense, indices, counts[begin:end], starts, ends, block)
+                assert torch.equal(valid, dense_valid)
+                torch.testing.assert_close(logits[begin:end, :cap * block][valid], gathered[valid], rtol=0, atol=0)
+        begin = end
+    print('Native paged / per-request nonpaged / dense INT8 selected-slot checks passed')
+
+
+def benchmark_sparse_mqa_stages(make_metadata, compute, metadata):
+    """Shared graph timing for both native paged and nonpaged sparse APIs."""
+    for name, fn in (('metadata', make_metadata), ('compute', lambda: compute(metadata)),
+                     ('metadata+compute', lambda: compute(make_metadata()))):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                fn()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured_output = fn()
+        samples = []
+        for _ in range(5):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            with torch.cuda.stream(stream):
+                start.record()
+                for _ in range(30):
+                    graph.replay()
+                end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) * 1000 / 30)
+        samples.sort()
+        print(f"Sparse MQA {name}: median={samples[2]:.3f} us, min={samples[0]:.3f} us, max={samples[-1]:.3f} us")
+        del captured_output, graph
+
+
+def test_int8_paged_sparse_mqa_logits(args):
+    inputs = make_int8_paged_sparse_inputs(args)
+    q, cache, weights = inputs['q'], inputs['kv_cache'], inputs['weights']
+    lens, table, requests, indices = (inputs[key] for key in ('context_lens', 'block_table', 'request_ids', 'sparse_indices'))
+    block, cap, page = (inputs[key] for key in ('sparse_block_kv', 'num_max_sparse_blocks', 'page_kv'))
+    counts = inputs['num_blocks_per_q']
+
+    def make_metadata():
+        return deep_gemm.get_paged_sparse_mqa_logits_metadata(lens, table, requests, page, indices, torch.int8, block)
+
+    def compute(metadata):
+        return deep_gemm.int8_paged_sparse_mqa_logits(q, cache, weights, metadata, cap, block)
+
+    metadata = make_metadata()
+    logits = compute(metadata)
+    if get_acc_check():
+        assert logits.shape == (q.size(0), round_up(cap * block, 512)) and logits.dtype == torch.bfloat16
+        if args.get('check_metadata', 0):
+            ref = ref_paged_sparse_metadata(indices, counts, lens, table, requests, page, block, cap)
+            verify_paged_sparse_metadata(decode_sparse_metadata(metadata, block), ref, q.size(0), requests)
+            print('Metadata check passed')
+        checked = check_int8_paged_sparse_reference_chunks(q, cache, weights, logits, lens, table, indices,
+                                                            counts, block, args.get('reference_chunk_q', 16))
+        if inputs['explicit_requests']:
+            assert checked == sum(min(length, cap * block) for length in inputs['context_lens_list'])
+        print('Accuracy check passed\n')
+    if get_benchmark():
+        benchmark_sparse_mqa_stages(make_metadata, compute, metadata)
+
+
 def test_sparse_mqa_logits(args) -> None:
     print('Testing Sparse MQA Logits:')
     data_type = args['data_type']
+    if args.get('gemm_type') == 'PagedSparseMqaLogits' and data_type == torch.int8:
+        return test_int8_paged_sparse_mqa_logits(args)
     num_heads = args.get('num_heads', 32)
     head_dim = args.get('head_dim', 128)
     sparse_block_kv = args.get('sparse_block_kv', 16)
@@ -3282,9 +3586,12 @@ def test_sparse_mqa_logits(args) -> None:
                     full_logits, sparse_indices, num_blocks_per_q, torch.zeros_like(context_lens), context_lens,
                     sparse_block_kv)
 
-        metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
-            context_lens=context_lens, block_table=block_table, indices=request_ids, page_kv=page_kv,
-            sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype, sparse_block_kv=sparse_block_kv)
+        def make_metadata():
+            return deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                context_lens=context_lens, block_table=block_table, indices=request_ids, page_kv=page_kv,
+                sparse_kv_block_indices=sparse_indices, qk_dtype=q_in[0].dtype, sparse_block_kv=sparse_block_kv)
+
+        metadata = make_metadata()
         if args.get('check_metadata', 0) and get_acc_check():
             decoded = decode_sparse_metadata(metadata, sparse_block_kv)
             ref_meta = ref_paged_sparse_metadata(
@@ -3292,15 +3599,20 @@ def test_sparse_mqa_logits(args) -> None:
                 sparse_block_kv, num_max_sparse_blocks)
             verify_paged_sparse_metadata(decoded, ref_meta, seq_len_q, request_ids)
             print("Metadata check passed")
-        sparse_logits = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
-            q=q_in, kv_cache=kv_cache_fp4, weights=weights, metadata=metadata,
-            num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv)
+        def compute(meta):
+            return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+                q=q_in, kv_cache=kv_cache_fp4, weights=weights, metadata=meta,
+                num_max_sparse_blocks=num_max_sparse_blocks, sparse_block_kv=sparse_block_kv)
+
+        sparse_logits = compute(metadata)
         if get_acc_check():
             torch.cuda.synchronize()
             if not torch.equal(sparse_logits[valid_mask], gathered_ref[valid_mask]):
                 print("ERROR: paged sparse MQA logits mismatch against gathered dense paged reference")
                 exit(1)
             print("Accuracy check passed\n")
+        if get_benchmark():
+            benchmark_sparse_mqa_stages(make_metadata, compute, metadata)
         return
 
     # Requests with random split points (2~4, upstream style); ks constant per request, per-token
@@ -3471,30 +3783,7 @@ def test_sparse_mqa_logits(args) -> None:
     if get_benchmark():
         # Capture each stage after warmup, so timings exclude JIT, input preparation
         # and Python dispatch. The end-to-end graph recomputes metadata every replay.
-        for name, fn in (('metadata', make_metadata), ('compute', lambda: compute(metadata)),
-                         ('metadata+compute', lambda: compute(make_metadata()))):
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(3):
-                    fn()
-            stream.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                captured_output = fn()
-            samples = []
-            for _ in range(5):
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                with torch.cuda.stream(stream):
-                    start.record()
-                    for _ in range(30):
-                        graph.replay()
-                    end.record()
-                end.synchronize()
-                samples.append(start.elapsed_time(end) * 1000 / 30)
-            samples.sort()
-            print(f"Sparse MQA {name}: median={samples[2]:.3f} us, min={samples[0]:.3f} us, max={samples[-1]:.3f} us")
-            del captured_output, graph
+        benchmark_sparse_mqa_stages(make_metadata, compute, metadata)
     return
 
 def test_batch_gemm(args) -> None:
