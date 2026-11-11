@@ -9,7 +9,7 @@ namespace cutlass::gemm::kernel {
 
 namespace SML = deep_gemm::sparse_mqa_logits;
 
-// INT8 sparse MQA. Non-paged physical indices are token offsets (including
+// PPU0010-only INT8 sparse MQA. Non-paged physical indices are token offsets (including
 // unaligned ks); paged physical indices are sparse-block offsets in the page pool.
 // Q scales have already been folded into the BF16 per-head weights. The MMA and
 // BF16 epilogue match PPUMqaLogits; only the KV gather and output slots differ.
@@ -44,11 +44,7 @@ public:
     static constexpr int MmaIterM = WARP_KV / InstM;
     static constexpr int MmaIterN = WARP_QH / InstN;
 
-#if __HGGC_ARCH__ == 100
     using ArchTag = cutlass::arch::PPU0010;
-#else
-    using ArchTag = cutlass::arch::PPU0015;
-#endif
     using MmaInst = typename cutlass::gemm::config::GetAiuMmaInst<
         ArchTag, ElementQK, ElementQK, ElementAcc>::type;
     using TileShape = Shape<Int<BLOCK_M>, Int<BLOCK_N>, Int<BLOCK_K>>;
@@ -64,17 +60,14 @@ public:
     static constexpr int MinBlocksPerMultiprocessor = 4;
     static_assert(NumThreadsPerCTA >= BLOCK_M, "KV scale producers require one thread per row");
 
-    // Use the same architecture-specific AIU/swizzled S2R pair as dense INT8.
+    // Use the same PPU0010 AIU/swizzled S2R pair as dense INT8.
     using DefaultOperandA = cutlass::gemm::config::DefaultGemm_AIU_Operand<
         ArchTag, ElementQK, false, Int<BLOCK_M>, Int<BLOCK_K>, false>;
     using DefaultOperandB = cutlass::gemm::config::DefaultGemm_AIU_Operand<
         ArchTag, ElementQK, false, Int<BLOCK_N>, Int<BLOCK_K>, true>;
-    using DefaultOperandAGather = cutlass::gemm::config::DefaultGemm_AIU_Operand<
-        ArchTag, ElementQK, false, Int<SPARSE_BLOCK_KV>, Int<BLOCK_K>, false>;
     using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
     using SmemCopyAtomB = typename DefaultOperandB::SmemCopyAtom;
     using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
-    using GatherAiuCopy = typename DefaultOperandAGather::CopyInst;
     using ContiguousAiuCopy = typename DefaultOperandA::CopyInst;
     using SmemLayoutA = decltype(tile_to_shape(typename DefaultOperandA::SmemLayoutAtom{},
         Shape<Int<BLOCK_M>, Int<BLOCK_K>, Int<kNumKVStages>>{}));
@@ -198,14 +191,10 @@ public:
         const auto* splits = reinterpret_cast<const KVSplit*>(
             params.metadata + sizeof(SML::MetadataHeader));
         const auto* schedule = reinterpret_cast<const SML::ScheduleEntry*>(splits + header->num_kv_splits);
-        cute::AiuDesc gather_desc;
-        gather_desc.template init<ElementQK, false, SPARSE_BLOCK_KV, BLOCK_K>(
-            nullptr, SPARSE_BLOCK_KV, BLOCK_K, StrideAB{});
         cute::AiuDesc contiguous_desc;
         contiguous_desc.template init<ElementQK, false, BLOCK_M, BLOCK_K>(
             nullptr, BLOCK_M, BLOCK_K, StrideAB{});
         constexpr uint32_t kStageBytes = BLOCK_M * BLOCK_K;
-        constexpr uint32_t kChunkBytes = SPARSE_BLOCK_KV * BLOCK_K;
 
         // The tensor view [pages, PAGE_KV, 1, 132] describes the page footprint,
         // not token-interleaved records: each page holds all K bytes, then all
@@ -313,7 +302,6 @@ public:
                         resolve_k(first, 0), contiguous_desc, 0, 0, 0);
                 }
             } else {
-#if __HGGC_ARCH__ == 100
                 // Coalesced 16-byte copies scatter directly into the full-stage
                 // PPU0010 swizzle. They share the AIU commit/wait pipeline.
                 constexpr int kVectorsPerThread = kStageBytes / (16 * NumThreadsPerCTA);
@@ -339,26 +327,6 @@ public:
                         *dst = uint4{0, 0, 0, 0};
                     }
                 }
-#else
-                if (thread_idx == 0) {
-                    CUTE_UNROLL
-                    for (int b = 0; b < kNumKVBlocksPerSplit; ++b) {
-                        if (b < num_blocks) {
-                            const uint32_t physical = deep_gemm::tix::ld_shared_u32(
-                                &split.kv_block_infos[b].physical_kv_block_idx);
-                            const uint64_t token = static_cast<uint64_t>(physical) * (kIsPaged ? SPARSE_BLOCK_KV : 1u);
-                            if (token < params.num_kv_tokens) {
-                                // Bound the descriptor by the real allocation, including an
-                                // unaligned block or a final block shorter than 8/16 tokens.
-                                gather_desc.dim_h = min(SPARSE_BLOCK_KV, params.num_kv_tokens - static_cast<uint32_t>(token));
-                                GatherAiuCopy::copy(storage.smem_k.data() + stage * kStageBytes + b * kChunkBytes,
-                                    resolve_k(physical, 0),
-                                    gather_desc, 0, 0, 0);
-                            }
-                        }
-                    }
-                }
-#endif
             }
             if constexpr (kIsPaged) {
                 if (is_contiguous) {
@@ -398,19 +366,6 @@ public:
                     // Keep invalid tails independent of input padding/address validity.
                     scale_dst = 0.0f;
                 }
-#if __HGGC_ARCH__ != 100
-                if (!is_contiguous &&
-                    static_cast<uint64_t>(physical) * (kIsPaged ? SPARSE_BLOCK_KV : 1u) >= params.num_kv_tokens) {
-                    // Entire unused blocks are zeroed in their physical smem region.
-                    // Blocks span whole 8-row swizzle groups, so these writes never
-                    // overlap a live block's AIU writes. Partial live blocks use padz.
-                    auto* zero_row = reinterpret_cast<uint32_t*>(
-                        storage.smem_k.data() + stage * kStageBytes + row * BLOCK_K);
-                    CUTE_UNROLL
-                    for (int word = 0; word < BLOCK_K / sizeof(uint32_t); ++word)
-                        zero_row[word] = 0;
-                }
-#endif
             }
         };
 
