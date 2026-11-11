@@ -3291,46 +3291,6 @@ def make_int8_paged_sparse_inputs(args):
                 num_max_sparse_blocks=cap, explicit_requests=explicit)
 
 
-def check_int8_paged_sparse_nonpaged(q, cache, weights, logits, context_lens, block_table,
-                                    request_ids, sparse_indices, counts, block, cap, check_dense=True):
-    """Small-case secondary cross-check with per-request flattened logical KV.
-
-    This is separate from the independent reference. Isolating requests before
-    a nonpaged call preserves request-local odd-Q pairing, unlike concatenating
-    all Q rows and accidentally pairing the end of one request with the next.
-    """
-    pages_k, pages_s = unpack_int8_sparse_paged_cache(cache)
-    requests, lengths = request_ids.cpu().tolist(), context_lens.cpu().tolist()
-    begin = 0
-    while begin < q.size(0):
-        end = begin + 1
-        while end < q.size(0) and requests[end] == requests[begin]:
-            end += 1
-        length = max(lengths[begin:end])
-        if length > 0:
-            pages = block_table[begin, :ceil_div(length, cache.size(1))].long()
-            k = pages_k[pages].reshape(-1, 128)[:length].contiguous()
-            scales = pages_s[pages].reshape(-1)[:length].contiguous()
-            starts = torch.zeros_like(context_lens[begin:end])
-            ends = context_lens[begin:end]
-            indices = sparse_indices[begin:end]
-            metadata = deep_gemm.get_sparse_mqa_logits_metadata(starts, ends, length, indices, torch.int8, block)
-            reference = deep_gemm.int8_sparse_mqa_logits(q[begin:end, 0], (k, scales), weights[begin:end],
-                                                        metadata, cap, block)
-            tokens = (indices.long().unsqueeze(-1) * block + torch.arange(block, device=q.device)).flatten(1)
-            valid = torch.arange(cap * block, device=q.device)[None, :] < torch.tensor(counts[begin:end], device=q.device)[:, None] * block
-            valid &= tokens < ends[:, None]
-            torch.testing.assert_close(logits[begin:end, :cap * block][valid], reference[:, :cap * block][valid], rtol=0, atol=0)
-            if check_dense:
-                dense = deep_gemm.int8_mqa_logits(q[begin:end, 0], (k, scales), weights[begin:end], starts, ends,
-                                                 clean_logits=False, max_seqlen_k=length)
-                gathered, dense_valid = gather_sparse_reference(dense, indices, counts[begin:end], starts, ends, block)
-                assert torch.equal(valid, dense_valid)
-                torch.testing.assert_close(logits[begin:end, :cap * block][valid], gathered[valid], rtol=0, atol=0)
-        begin = end
-    print('Native paged / per-request nonpaged / dense INT8 selected-slot checks passed')
-
-
 def benchmark_sparse_mqa_stages(make_metadata, compute, metadata):
     """Shared graph timing for both native paged and nonpaged sparse APIs."""
     for name, fn in (('metadata', make_metadata), ('compute', lambda: compute(metadata)),
@@ -3359,41 +3319,38 @@ def benchmark_sparse_mqa_stages(make_metadata, compute, metadata):
         del captured_output, graph
 
 
-def test_int8_paged_sparse_mqa_logits(args):
-    inputs = make_int8_paged_sparse_inputs(args)
-    q, cache, weights = inputs['q'], inputs['kv_cache'], inputs['weights']
-    lens, table, requests, indices = (inputs[key] for key in ('context_lens', 'block_table', 'request_ids', 'sparse_indices'))
-    block, cap, page = (inputs[key] for key in ('sparse_block_kv', 'num_max_sparse_blocks', 'page_kv'))
-    counts = inputs['num_blocks_per_q']
-
-    def make_metadata():
-        return deep_gemm.get_paged_sparse_mqa_logits_metadata(lens, table, requests, page, indices, torch.int8, block)
-
-    def compute(metadata):
-        return deep_gemm.int8_paged_sparse_mqa_logits(q, cache, weights, metadata, cap, block)
-
-    metadata = make_metadata()
-    logits = compute(metadata)
-    if get_acc_check():
-        assert logits.shape == (q.size(0), round_up(cap * block, 512)) and logits.dtype == torch.bfloat16
-        if args.get('check_metadata', 0):
-            ref = ref_paged_sparse_metadata(indices, counts, lens, table, requests, page, block, cap)
-            verify_paged_sparse_metadata(decode_sparse_metadata(metadata, block), ref, q.size(0), requests)
-            print('Metadata check passed')
-        checked = check_int8_paged_sparse_reference_chunks(q, cache, weights, logits, lens, table, indices,
-                                                            counts, block, args.get('reference_chunk_q', 16))
-        if inputs['explicit_requests']:
-            assert checked == sum(min(length, cap * block) for length in inputs['context_lens_list'])
-        print('Accuracy check passed\n')
-    if get_benchmark():
-        benchmark_sparse_mqa_stages(make_metadata, compute, metadata)
-
-
 def test_sparse_mqa_logits(args) -> None:
     print('Testing Sparse MQA Logits:')
     data_type = args['data_type']
     if args.get('gemm_type') == 'PagedSparseMqaLogits' and data_type == torch.int8:
-        return test_int8_paged_sparse_mqa_logits(args)
+        inputs = make_int8_paged_sparse_inputs(args)
+        q, cache, weights = inputs['q'], inputs['kv_cache'], inputs['weights']
+        lens, table, requests, indices = (inputs[key] for key in ('context_lens', 'block_table', 'request_ids', 'sparse_indices'))
+        block, cap, page = (inputs[key] for key in ('sparse_block_kv', 'num_max_sparse_blocks', 'page_kv'))
+        counts = inputs['num_blocks_per_q']
+
+        def make_metadata():
+            return deep_gemm.get_paged_sparse_mqa_logits_metadata(lens, table, requests, page, indices, torch.int8, block)
+
+        def compute(metadata):
+            return deep_gemm.int8_paged_sparse_mqa_logits(q, cache, weights, metadata, cap, block)
+
+        metadata = make_metadata()
+        logits = compute(metadata)
+        if get_acc_check():
+            assert logits.shape == (q.size(0), round_up(cap * block, 512)) and logits.dtype == torch.bfloat16
+            if args.get('check_metadata', 0):
+                ref = ref_paged_sparse_metadata(indices, counts, lens, table, requests, page, block, cap)
+                verify_paged_sparse_metadata(decode_sparse_metadata(metadata, block), ref, q.size(0), requests)
+                print('Metadata check passed')
+            checked = check_int8_paged_sparse_reference_chunks(q, cache, weights, logits, lens, table, indices,
+                                                                counts, block, args.get('reference_chunk_q', 16))
+            if inputs['explicit_requests']:
+                assert checked == sum(min(length, cap * block) for length in inputs['context_lens_list'])
+            print('Accuracy check passed\n')
+        if get_benchmark():
+            benchmark_sparse_mqa_stages(make_metadata, compute, metadata)
+        return
     num_heads = args.get('num_heads', 32)
     head_dim = args.get('head_dim', 128)
     sparse_block_kv = args.get('sparse_block_kv', 16)

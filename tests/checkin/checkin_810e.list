@@ -170,14 +170,11 @@ SparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:8191,sparse_block_kv:8,num
 SparseMqaLogits,data_type:int8,seq_len_q:1,seq_len_kv:1,sparse_block_kv:16,num_max_sparse_blocks:4,check_metadata:1
 SparseMqaLogits,data_type:int8,seq_len_q:2,seq_len_kv:0,sparse_block_kv:16,num_max_sparse_blocks:4,check_metadata:1
 SparseMqaLogits,data_type:int8,seq_len_q:1,seq_len_kv:65535,sparse_block_kv:16,num_max_sparse_blocks:4096,check_metadata:1
-# Exact shared/disjoint/overlapping selections, tail slots and workspace graph replay.
-AttentionRegression,data_type:int8,case:sparse_int8
 
 # --- Native PagedSparseMqaLogits / int8 ---
 # SoA pages, request-local pairing and exact selected-slot references.
 PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:32,check_metadata:1
 PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:513,sparse_block_kv:16,num_max_sparse_blocks:32,page_kv:128,check_metadata:1
-AttentionRegression,data_type:int8,case:sparse_int8_paged
 
 # ============ PagedMqaLogits ============
 

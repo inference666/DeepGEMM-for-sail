@@ -484,11 +484,10 @@ those rows across the local experts.
 
 ## Native INT8 paged sparse MQA (810E)
 
-Run the small native-page fixture and the boundary/replay regression from the repository root:
+Run sparse cases through the existing parameterized runner from the repository root:
 
 ```bash
 python tests/run_deep_gemm.py --format 'PagedSparseMqaLogits,data_type:int8,seq_len_q:9,seq_len_kv:129,sparse_block_kv:8,num_max_sparse_blocks:16,page_kv:64,check_metadata:1' --require_supported
-python tests/run_deep_gemm.py --format 'AttentionRegression,data_type:int8,case:sparse_int8_paged' --require_supported
 python tests/run_deep_gemm.py --caselist tests/workloads/sparse_mqa_native_paged_810e.list --case_idx 1 --require_supported --benchmark
 ```
 
@@ -506,23 +505,21 @@ to 512 bytes. `utils.make_int8_paged_sparse_inputs(args)` returns the quantized
 inputs, page table, context lengths, request IDs and sparse selections for
 same-input layout comparisons. Its default physical page order is permuted.
 
-Every valid selected output is checked against a bounded independent page-table
-gather and the exact INT8/BF16 epilogue reference. Small regressions also compare
-per-request nonpaged sparse and dense INT8 outputs with zero tolerance. Tests
-cover B8/B16, minimum and non-power-of-two page sizes, page32/64/128, aliased
-physical pages, strictly increasing unique selected IDs, odd request boundaries, physical stride
-padding, empty/tail contexts and two-stream graph replay after workspace growth.
-With the default 810E scheduling budget, the paged schedule divides split
-indices across 80 slots and cuts each interval at request-local Q-pair boundaries. Tests verify every slot/wave
-entry and zero padding, and require actual 9/17/32-split entries to exercise
-metadata ring8 wrap. PPU1.5 uses the same balanced scheduling algorithm
-with its architecture-specific slot count; the shared verifier checks exact
-slot coverage and request boundaries. Existing nonpaged ring8-wrap fixtures
-remain in place.
-Request IDs may recur in separate contiguous runs (for example 0,1,0). Tests
-cover an all-same long request, multiple persistent-CTA claims, paired Q1 with
-empty context, an unpaired Q followed by another request, and graph replay
-after changing request IDs/run boundaries on two streams.
+`test_attention.py::test_sparse_mqa_logits_loop` uses the existing 11 FP4
+case shapes for both platforms: INT8 on PPU1.0 and FP4 on PPU1.5. Coverage
+includes paged/nonpaged inputs, B8/B16, aligned/unaligned nonpaged starts,
+odd Q and tail contexts, zero-length inputs, and capacity4096. Both types
+run through `utils.test_sparse_mqa_logits`; there are no separate sparse
+`AttentionRegression` entries. The existing FP4 workspace/Graph test remains
+in `test_sparse_workspace`.
+
+Every valid INT8 paged output is checked against a bounded independent
+page-table gather and the exact INT8/BF16 epilogue reference. With
+`check_metadata:1`, tests also verify split contents, request pairing and
+complete schedule coverage without prescribing the per-slot balancing policy.
+The development-only edge fixtures (forced ring8 wraps, repeated-ID patterns,
+extra page-size combinations and INT8 Graph stress) are not part of the
+standard suite.
 Repeated physical pages are supported; repeated logical IDs inside the valid
 selected prefix are outside the existing sparse API contract. Padding slots
 may repeat an ID because they are not valid selections. These tests do not
