@@ -28,7 +28,9 @@ using Config = std::tuple<int, int, int, int, int, int, int, std::tuple<int, int
 static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                              const torch::Tensor& out, const torch::Tensor& m_indices,
                                                              const int& m, const int& n, const int& k,
-                                                             const int& num_groups, std::optional<ConfigTuple> configs) {
+                                                             const int& num_groups, std::optional<ConfigTuple> configs,
+                                                             const std::optional<torch::Tensor>& c = std::nullopt,
+                                                             bool use_psum_layout = false) {
     int num_sms = get_num_sms();
     Config cfg;
     if (configs.has_value()) {
@@ -45,7 +47,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
-    static constexpr GemmType kGemmType = GemmType::MGroupedContiguous;
+    const GemmType gemm_type = use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout
+                                              : GemmType::MGroupedContiguous;
     using StrideA = cute::Stride<int64_t, cute::Int<1>, int64_t>;
     using StrideB = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
@@ -58,6 +61,18 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     cutlass::bfloat16_t* input_a = reinterpret_cast<cutlass::bfloat16_t*>(lhs.data_ptr<at::BFloat16>());
     cutlass::bfloat16_t* output = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr<at::BFloat16>());
 
+    const bool with_c = c.has_value();
+    auto* source = with_c ? reinterpret_cast<cutlass::bfloat16_t*>(c->data_ptr<at::BFloat16>()) : output;
+    // Stage C only in retired A/B slots; the epilogue reads any excess from C.
+    // Both paths keep the shared-memory budget chosen by the A/B configuration.
+    const bool stage_c = with_c && is_ppu1v5_device() && num_stages >= 2 &&
+                         block_m % 16 == 0 && block_n % 16 == 0 &&
+                         reinterpret_cast<uintptr_t>(source) % 16 == 0 && n % 8 == 0 &&
+                         reinterpret_cast<uintptr_t>(output) % 16 == 0 &&
+                         SMSIZE <= device_runtime->get_prop()->sharedMemPerBlockOptin;
+    const char* kernel_name = stage_c ? "bf16_grouped_deep_gemm_contiguous_stage_c" :
+                              with_c  ? "bf16_grouped_deep_gemm_contiguous_add_c" :
+                                        "bf16_grouped_deep_gemm_contiguous";
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.cu_count = num_sms_new;
@@ -70,8 +85,8 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .mainloopargs = {input_a, stride_A, input_b, stride_B},
         .epilogueargs =
             {
-                {1, 0},
-                output,
+                {1.0f, with_c ? 1.0f : 0.0f},
+                source,
                 stride_D,
                 output,
                 stride_D,
@@ -81,23 +96,33 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         .signal = nullptr};
 
     BF16GemmCutlass3Runtime::GemmKernelParams params =
-        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr, with_c);
     auto args = BF16GemmCutlass3Runtime::Args{
-        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "MGroupedContiguous",
-                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
+        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
+                        use_psum_layout ? "MGroupedContiguousWithPsumLayout" : "MGroupedContiguous",
+                        "Default", kernel_name, enable_sbo_overlap, with_c, stage_c},
         .launch_args = {grid, block, SMSIZE},
         .kernel_params = params};
     const auto& code = BF16GemmCutlass3Runtime::generate(args);
-    const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code);
+    const auto& runtime = compiler->build(kernel_name, code);
     const auto& kernel = runtime->kernel;
     int blocks_per_cu = 0;
-    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    if (stage_c) {
+        DG_HGGC_DRIVER_CHECK(lazy_hgFuncSetAttribute(kernel, HG_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SMSIZE));
+    }
+    DG_HGGC_DRIVER_CHECK(hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE));
+    DG_HOST_ASSERT(blocks_per_cu > 0);
     args.launch_args.grid_dim.x *= blocks_per_cu;
 
     DgProfParam dg_prof_params;
     if (ProfilingInterface::Instance().get_op_info()) {
-        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
+        dg_prof_params.set_params(gemm_type, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
                                   grouped_layout, current_stream());
+        if (use_psum_layout) dg_prof_params.add_params("use_psum_layout", 1);
+        if (with_c) {
+            dg_prof_params.add_params("accumulate", source == output ? "alias" : "separate");
+            dg_prof_params.add_params("stage_c", int(stage_c));
+        }
     }
     ProfilingInterface::Instance().instrument(true, dg_prof_params);
 
@@ -112,6 +137,7 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
         hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
 
         printf("[GroupedContiguous:]\n");
+        printf("WithC:%d, StageC:%d\n", int(with_c), int(stage_c));
         printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
         printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
                args.launch_args.grid_dim.x);

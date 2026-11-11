@@ -33,6 +33,12 @@ DeepGEMM-for-sail maintains its release identifiers independently of the upstrea
 
 ### Changed
 
+- **M890 M-grouped BF16 NT GEMM**: `m_grouped_bf16_gemm_nt_contiguous`
+  supports optional BF16 C, including in-place `c=d`, with FP32 accumulation
+  before BF16 output. Adds compact expert end offsets through
+  `use_psum_layout=True`, including empty experts, with the existing PPU
+  argument names and positional `configs` preserved.
+
 - **BF16 dense GEMM**: `bf16_gemm_nt` now supports odd N with BF16 or
   FP32 output on 890P, including an optimized N=1 path. On 810E, N must be
   even except for N=1 without an explicit configuration; that path requires
