@@ -512,11 +512,13 @@ per-request nonpaged sparse and dense INT8 outputs with zero tolerance. Tests
 cover B8/B16, minimum and non-power-of-two page sizes, page32/64/128, aliased
 physical pages, strictly increasing unique selected IDs, odd request boundaries, physical stride
 padding, empty/tail contexts and two-stream graph replay after workspace growth.
-On 810E, the paged schedule divides split indices across 80 slots and cuts each
-slot interval at request-local Q-pair boundaries. Tests verify every slot/wave
+With the default 810E scheduling budget, the paged schedule divides split
+indices across 80 slots and cuts each interval at request-local Q-pair boundaries. Tests verify every slot/wave
 entry and zero padding, and require actual 9/17/32-split entries to exercise
-metadata ring8 wrap. PPU1.5 retains its bounded-eight entries and exact stable
-wave-order verifier. Existing nonpaged ring8-wrap fixtures remain in place.
+metadata ring8 wrap. PPU1.5 uses the same balanced scheduling algorithm
+with its architecture-specific slot count; the shared verifier checks exact
+slot coverage and request boundaries. Existing nonpaged ring8-wrap fixtures
+remain in place.
 Request IDs may recur in separate contiguous runs (for example 0,1,0). Tests
 cover an all-same long request, multiple persistent-CTA claims, paired Q1 with
 empty context, an unpaired Q followed by another request, and graph replay

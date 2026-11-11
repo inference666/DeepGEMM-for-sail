@@ -489,13 +489,24 @@ torch::Tensor fp8_fp4_paged_mqa_logits(const std::pair<torch::Tensor, std::optio
 // carries a `ks % sparse_block_kv` offset). The valid count is inferred from the KV length:
 // min(num_max_sparse_blocks, ceil_div(kv_end - kv_start, sparse_block_kv)); the tail padding is
 // never read. Output logits are slot-compacted bf16: column = slot * sparse_block_kv + token_in_block.
+static void check_sparse_metadata_arch() {
+    const auto arch = get_ppu_arch();
+    TORCH_CHECK(arch == AC_PPU0010 or arch == AC_PPU0015,
+                "sparse metadata requires 810E (INT8) or M890 (MXFP4)");
+}
+
 torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
                                              const torch::Tensor& cu_seq_len_k_end,
                                              int num_kv_tokens,
                                              const torch::Tensor& sparse_kv_block_indices,
                                              torch::ScalarType qk_dtype,
                                              int sparse_block_kv, bool use_unaligned_ks = false) {
-    check_indexer_arch(torch::kInt8, true);
+    TORCH_CHECK(sparse_kv_block_indices.is_cuda() and
+                cu_seq_len_k_start.device() == sparse_kv_block_indices.device() and
+                cu_seq_len_k_end.device() == sparse_kv_block_indices.device(),
+                "sparse indices and context bounds must be on the same device");
+    const c10::cuda::CUDAGuard guard(sparse_kv_block_indices.device());
+    check_sparse_metadata_arch();
     const int num_q_tokens = static_cast<int>(cu_seq_len_k_start.size(0));
     DG_HOST_ASSERT(num_q_tokens > 0 and cu_seq_len_k_end.size(0) == num_q_tokens);
     DG_HOST_ASSERT(cu_seq_len_k_start.scalar_type() == torch::kInt32 and cu_seq_len_k_end.scalar_type() == torch::kInt32);
@@ -604,6 +615,7 @@ torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& context_
                 "page_kv must be positive and divisible by sparse_block_kv");
     TORCH_CHECK(qk_dtype == torch::kInt8, "paged sparse metadata requires torch.int8 for packed MXFP4 or INT8");
     const c10::cuda::CUDAGuard guard(context_lens.device());
+    check_sparse_metadata_arch();
     const int num_max_sparse_blocks = static_cast<int>(sparse_kv_block_indices.size(1));
     const int num_slots = sparse_mqa_logits::get_num_sparse_slots();
     TORCH_CHECK(num_slots > 0, "sparse metadata requires a positive schedule slot count");

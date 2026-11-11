@@ -3158,8 +3158,7 @@ def check_fp4_sparse_prefix_reference_chunks(q, kv, weights, logits, request_siz
                 local_ends = torch.tensor(local_lengths, device=q[0].device, dtype=torch.int32)
                 expected = deep_gemm.fp8_fp4_mqa_logits(
                     (q[0][begin:end], q[1][begin:end]), request_kv, weights[begin:end],
-                    torch.zeros_like(local_ends), local_ends, clean_logits=False,
-                    max_seqlen_k=prefix_length, logits_dtype=torch.bfloat16)
+                    torch.zeros_like(local_ends), local_ends, max_seqlen_k=prefix_length)
                 valid = columns[None, :] < local_ends[:, None]
                 actual = logits[begin:end, :prefix_length]
                 torch.testing.assert_close(actual[valid], expected[:, :prefix_length][valid], rtol=0, atol=0,
@@ -3351,7 +3350,7 @@ def check_int8_paged_sparse_nonpaged(q, cache, weights, logits, context_lens, bl
             torch.testing.assert_close(logits[begin:end, :cap * block][valid], reference[:, :cap * block][valid], rtol=0, atol=0)
             if check_dense:
                 dense = deep_gemm.int8_mqa_logits(q[begin:end, 0], (k, scales), weights[begin:end], starts, ends,
-                                                 clean_logits=False, max_seqlen_k=length, logits_dtype=torch.bfloat16)
+                                                 clean_logits=False, max_seqlen_k=length)
                 gathered, dense_valid = gather_sparse_reference(dense, indices, counts[begin:end], starts, ends, block)
                 assert torch.equal(valid, dense_valid)
                 torch.testing.assert_close(logits[begin:end, :cap * block][valid], gathered[valid], rtol=0, atol=0)
@@ -3496,7 +3495,8 @@ def test_sparse_mqa_logits(args) -> None:
             [req_page_lists[request_indices[t]] + [0] * (max_pages - len(req_page_lists[request_indices[t]]))
              for t in range(seq_len_q)], device='cuda', dtype=torch.int32)
 
-        # Fused fp4 cache: [num_pages, page_kv, 1, head_dim/2 + 4] uint8 (SF trails each row),
+        # Fused fp4 cache: uint8 [num_pages, page_kv, 1, head_dim/2 + 4], with all K rows
+        # followed by all scale words inside each page (SoA),
         # page stride padded to 512B (upstream test construction; the kernel asserts it)
         kv_x = torch.randn(total_pages, page_kv, 1, head_dim, device='cuda', dtype=torch.bfloat16)
         kv_raw = kv_cache_cast_to_fp4(kv_x)[0]

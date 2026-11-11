@@ -449,7 +449,7 @@ def test_int8_sparse_edges(check_accuracy=True):
             indices, counts, ks, ke, num_kv, block, capacity, unaligned), rows)
         dense = deep_gemm.int8_mqa_logits(
             q, (k, scales), weights, ks, ke, clean_logits=False,
-            max_seqlen_k=num_kv, logits_dtype=torch.bfloat16)
+            max_seqlen_k=num_kv)
         # Q4 bounds the gathered-K FP32 temporary: the new B16 ring8 case
         # would otherwise materialize 161 * 2112 * 128 * 4 = 174 MB at once.
         # Both dense gather and the exact BF16 reference still check every
@@ -958,7 +958,7 @@ def test_fp4_paged_shared_metadata_edges():
 
         def check(self, outputs):
             metadata, logits = outputs
-            assert logits.shape == (self.rows, (self.cap * self.block + 511) // 512 * 512)
+            assert logits.shape == (self.rows, self.cap * self.block)
             assert logits.dtype == torch.bfloat16
             splits, waves, unaligned = metadata[:12].view(torch.int32).cpu().tolist()
             live = 16 + splits * (16 + 128 // self.block * 8) + waves * get_sparse_num_slots() * 16

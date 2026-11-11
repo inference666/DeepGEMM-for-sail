@@ -430,7 +430,7 @@ recommended 810E/M890 integration settings.
 
 Sparse MQA computes indexer logits only for selected KV blocks, for both
 prefill and paged decode. **MXFP4** supports both layouts on M890P;
-**INT8** supports the non-paged layout on 810E. Both use **32 heads** and
+**INT8** supports both layouts on 810E. Both use **32 heads** and
 **head dimension 128**. The `fp8_fp4` sparse APIs currently accept MXFP4
 only. Build metadata with the matching helper before calling the logits kernel:
 
@@ -439,6 +439,7 @@ only. Build metadata with the matching helper before calling the logits kernel:
 | MXFP4 non-paged | `get_sparse_mqa_logits_metadata` | `fp8_fp4_sparse_mqa_logits` | `[T,32,64]` / `[T,32]` |
 | MXFP4 paged | `get_paged_sparse_mqa_logits_metadata` | `fp8_fp4_paged_sparse_mqa_logits` | `[T,1,32,64]` / `[T,1,32]` |
 | INT8 non-paged | `get_sparse_mqa_logits_metadata` | `int8_sparse_mqa_logits` | `[T,32,128]` / folded into weights |
+| INT8 paged | `get_paged_sparse_mqa_logits_metadata` | `int8_paged_sparse_mqa_logits` | `[T,1,32,128]` / folded into weights |
 
 Here `T` is the number of query tokens. For MXFP4, Q stores packed codes in
 contiguous int8 tensors, and Q scales pack the E8M0 bytes into contiguous
@@ -465,10 +466,16 @@ KV grid; set `use_unaligned_ks=True` in both calls when `ks` is unaligned
 (the token offset then includes `ks % sparse_block_kv`). Paged sparse MQA
 requires a positive `page_kv`
 that is a multiple of `sparse_block_kv`; its fused uint8 KV cache has shape
-`[num_pages,page_kv,1,68]` and a 512-byte-aligned page stride.
+`[num_pages,page_kv,1,68]` for MXFP4 or `[num_pages,page_kv,1,132]` for INT8,
+with a 512-byte-aligned page stride. Each page stores all K rows followed
+by all scale words; it does not interleave data and scale per token.
+Paged metadata uses `context_lens[T]`, request `indices[T]`, and an expanded
+`block_table[T,max_pages]`; paired Q rows must share the same page mapping.
 
-The output is BF16 with shape
-`[T,num_max_sparse_blocks*sparse_block_kv]`, with an aligned physical row stride.
+The output is BF16. Let `L=num_max_sparse_blocks*sparse_block_kv`. MXFP4
+returns `[T,L]`; INT8 retains `[T,round_up(L,512)]`, including unspecified
+padding columns. Both use a physical row stride rounded up to 512 elements.
+Use `logits[:, :L]` for a common logical view.
 Logical columns are compacted by selected block slot:
 `column = slot*sparse_block_kv + token_in_block`, rather than absolute KV
 token position. Unused slots, positions outside the context and padding
@@ -481,7 +488,7 @@ import deep_gemm as dg
 
 # q_int8: [T,32,128], k_int8: [K,128], k_scale: FP32 [K].
 # head_weights: BF16 [T,32], q_scale: positive FP32 [T,32].
-weights = (head_weights * q_scale.to(torch.bfloat16)).contiguous()
+weights = (head_weights.float() * q_scale.float()).to(torch.bfloat16).contiguous()
 capacity = selected_blocks.size(1)
 metadata = dg.get_sparse_mqa_logits_metadata(
     ks, ke, k_int8.size(0), selected_blocks, torch.int8, 16,
