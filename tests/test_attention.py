@@ -855,6 +855,183 @@ def test_int8_paged_sparse_edges(check_accuracy=True):
     print('Passed native INT8 paged sparse SoA, aliases, strict unique IDs, repeated request-ID runs, ring8 wrap and two-stream graph replay')
 
 
+def test_fp4_paged_shared_metadata_edges():
+    """Exact FP4 outputs and shared metadata, including actual long entries.
+
+    Packed inputs have an analytic reference independent of either sparse or
+    dense compute. Every selected valid output is checked; allocation padding
+    and tokens past context_lens are intentionally excluded.
+    """
+    if not is_ppu1v5_device():
+        print('Skipping FP4 shared paged metadata edges: requires PPU1.5')
+        return
+    from utils import decode_sparse_metadata, ref_paged_sparse_metadata, verify_paged_sparse_metadata
+    from utils import get_sparse_num_slots
+
+    class PagedCase:
+        def __init__(self, block, lengths, requests, capacity, page=128):
+            self.block, self.page, self.cap = block, page, capacity
+            self.rows = len(lengths)
+            assert len(requests) == self.rows and self.rows > 0
+            assert block in (8, 16) and page % block == 0
+            assert 0 < capacity <= 4096 and capacity % 4 == 0
+            self.max_pages = max(1, (max(lengths) + page - 1) // page)
+            self.num_pages = self.max_pages + 3
+            # Code 2/4/5/6 means E2M1 value 1/2/3/4. E8M0 127 means scale 1.
+            # Values vary across physical tokens and blocks, so wrong page,
+            # split-stage, or output-slot addresses cannot all give the same result.
+            physical = torch.arange(self.num_pages * page, dtype=torch.int64)
+            value_index = (physical * 5 + physical // 7 + physical // block * 3) % 4
+            codes = torch.tensor([2, 4, 5, 6], dtype=torch.uint8)[value_index]
+            self.k_values = (value_index + 1).view(self.num_pages, page)
+            payload = page * 68
+            stride = (payload + 511) // 512 * 512 + 512
+            storage = torch.full((self.num_pages, stride), 0xA5, dtype=torch.uint8, device='cuda')
+            packed = (codes | (codes << 4)).view(-1, 1).expand(-1, 64).contiguous()
+            storage[:, :page * 64].copy_(packed.view(self.num_pages, page * 64))
+            storage[:, page * 64:payload].fill_(0x7F)
+            self.cache = storage.as_strided((self.num_pages, page, 1, 68), (stride, 68, 68, 1))
+            row = torch.arange(self.rows)
+            self.q_values = 1 + row % 2
+            q_codes = torch.where(row % 2 == 0, 0x22, 0x44).to(torch.int8)
+            self.q = (
+                q_codes[:, None, None, None].expand(-1, 1, 32, 64).contiguous().cuda(),
+                torch.full((self.rows, 1, 32), 0x7F7F7F7F, dtype=torch.int32, device='cuda'),
+            )
+            self.weight_factors = torch.tensor([1.0, -1.0, 0.5, 0.0])[row % 4]
+            self.weights = (self.weight_factors[:, None] / 32).expand(-1, 32).contiguous().to(
+                device='cuda', dtype=torch.bfloat16)
+            self.lens = torch.empty(self.rows, dtype=torch.int32, device='cuda')
+            self.requests = torch.empty_like(self.lens)
+            self.table = torch.empty((self.rows, self.max_pages), dtype=torch.int32, device='cuda')
+            self.blocks = torch.empty((self.rows, self.cap), dtype=torch.int32, device='cuda')
+            self.permutation = list(range(self.num_pages))
+            random.Random(1234 + block + self.rows).shuffle(self.permutation)
+            self.update(lengths, requests)
+
+        def update(self, lengths, requests, phase=0):
+            assert len(lengths) == len(requests) == self.rows
+            assert all(0 <= length <= self.max_pages * self.page for length in lengths)
+            # Equal IDs in separate runs may use different page tables. Each
+            # contiguous request run, including its odd tail, shares one table.
+            tables, selected, counts = [], [], []
+            run = -1
+            for index, (length, request) in enumerate(zip(lengths, requests)):
+                if index == 0 or requests[index - 1] != request:
+                    run += 1
+                tables.append([self.permutation[(j + run * 3 + phase) % self.num_pages]
+                               for j in range(self.max_pages)])
+                available = (length + self.block - 1) // self.block
+                count = min(available, self.cap)
+                blocks = list(range(count))
+                # Select the last available block as well, exercising context
+                # tails and a sparse hole when the capacity is smaller.
+                if available > count and count:
+                    blocks[-1] = available - 1
+                selected.append(blocks + [0] * (self.cap - count))
+                counts.append(count)
+            lens_cpu = torch.tensor(lengths, dtype=torch.int32)
+            tables_cpu = torch.tensor(tables, dtype=torch.int32)
+            blocks_cpu = torch.tensor(selected, dtype=torch.int32)
+            self.lens.copy_(lens_cpu)
+            self.requests.copy_(torch.tensor(requests, dtype=torch.int32))
+            self.table.copy_(tables_cpu)
+            self.blocks.copy_(blocks_cpu)
+            self.counts = counts
+            logical = (blocks_cpu.long()[:, :, None] * self.block + torch.arange(self.block)).flatten(1)
+            page_ids = tables_cpu.long().gather(1, logical // self.page)
+            kv_values = self.k_values[page_ids, logical % self.page]
+            # All 128 channels and 32 heads have the same positive Q/K value.
+            # Dot, BF16 weights, and reduction are exact for these small powers
+            # of two and integer multiples; negative/zero weights remain visible.
+            self.expected = (128 * kv_values * self.q_values[:, None] *
+                             self.weight_factors[:, None]).to(torch.bfloat16)
+            self.valid = (torch.arange(self.cap * self.block)[None, :] <
+                          torch.tensor(counts)[:, None] * self.block) & (logical < lens_cpu[:, None])
+
+        def run(self):
+            metadata = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                self.lens, self.table, self.requests, self.page, self.blocks, torch.int8, self.block)
+            logits = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+                self.q, self.cache, self.weights, metadata, self.cap, self.block)
+            return metadata, logits
+
+        def check(self, outputs):
+            metadata, logits = outputs
+            assert logits.shape == (self.rows, (self.cap * self.block + 511) // 512 * 512)
+            assert logits.dtype == torch.bfloat16
+            splits, waves, unaligned = metadata[:12].view(torch.int32).cpu().tolist()
+            live = 16 + splits * (16 + 128 // self.block * 8) + waves * get_sparse_num_slots() * 16
+            assert 16 <= live <= metadata.numel() and unaligned == 0
+            decoded = decode_sparse_metadata(metadata[:live], self.block)
+            ref = ref_paged_sparse_metadata(self.blocks, self.counts, self.lens, self.table,
+                                            self.requests, self.page, self.block, self.cap)
+            verify_paged_sparse_metadata(decoded, ref, self.rows, self.requests)
+            actual = logits[:, :self.cap * self.block].cpu()
+            torch.testing.assert_close(actual[self.valid], self.expected[self.valid], rtol=0, atol=0)
+            return decoded
+
+    num_slots = get_sparse_num_slots()
+    for block in (8, 16):
+        for entry_splits in (9, 17, 32):
+            rows = 2 * num_slots
+            case = PagedCase(block, [128 * entry_splits] * rows, [0] * rows,
+                             entry_splits * (128 // block))
+            decoded = case.check(case.run())
+            entries = [entry for entry in decoded['schedule'] if entry[0] < entry[1]]
+            assert decoded['num_kv_splits'] == num_slots * entry_splits
+            assert decoded['num_waves'] == 1 and len(entries) == num_slots
+            assert all(end - begin == entry_splits for begin, end, _, _ in entries)
+            print(f'FP4 shared metadata long entry passed: B={block}, entry_splits={entry_splits}, '
+                  f'active_slots={len(entries)}, valid_positions={int(case.valid.sum())}', flush=True)
+
+    for block in (8, 16):
+        # More than two full producer grids also exercises cached run reuse on
+        # dynamically claimed work. Boundaries at 31/32 exercise ballot lane 31.
+        rows = 2 * (4 * num_slots) + 1
+        requests = [0] * 31 + [1] + [0] * (rows - 32)
+        pattern = [0, 1, block - 1, block + 1, 127, 128, 129, 255, 257]
+        lengths = [pattern[i % len(pattern)] for i in range(rows)]
+        lengths[0], lengths[1], lengths[-1] = 129, 0, 129
+        case = PagedCase(block, lengths, requests, 16)
+        decoded = case.check(case.run())
+        assert case.rows % 2 == 1
+        assert any(s['is_contiguous'] and s['num_kv_blocks'] < 128 // block
+                   for s in decoded['splits']), 'Missing partial same-page hint'
+        assert any(not s['is_contiguous'] for s in decoded['splits']), 'Missing page crossing'
+        paired_empty = [s for s in decoded['splits'] if s['q_token_base'] == 0]
+        assert paired_empty and all(s['q1_slot_base'] != 0xFFFF for s in paired_empty)
+        unpaired = [s for s in decoded['splits'] if s['q_token_base'] == rows - 1]
+        assert unpaired and all(s['q1_slot_base'] == 0xFFFF for s in unpaired)
+        print(f'FP4 shared metadata repeated-run/partial passed: B={block}, rows={rows}, '
+              f'valid_positions={int(case.valid.sum())}', flush=True)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            case.run()  # Allocate this stream's workspace before capture.
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = case.run()
+        for phase in range(3):
+            # Change Q pairing and page mappings while retaining input addresses.
+            replay_requests = ([0] * rows if phase == 0 else
+                               [0] * 32 + [1] + [0] * (rows - 33))
+            replay_lengths = ([0] * rows if phase == 2 else lengths[phase:] + lengths[:phase])
+            with torch.cuda.stream(stream):
+                case.update(replay_lengths, replay_requests, phase + 1)
+                graph.replay()
+            stream.synchronize()
+            decoded = case.check(outputs)
+            if phase == 2:
+                assert decoded['num_kv_splits'] == 0
+                assert all(entry == (0, 0, 0, 0) for entry in decoded['schedule'])
+        print(f'FP4 shared metadata graph replay passed: B={block}, changed runs/pages/lengths and empty schedule',
+              flush=True)
+    print('Passed FP4 shared paged metadata edges', flush=True)
+
+
 def test_sparse_workspace():
     """Check sparse workspace lifetime across graph replay and larger eager calls.
 
@@ -1048,4 +1225,5 @@ if __name__ == '__main__':
     test_sparse_mqa_logits_loop()
     test_int8_sparse_edges()
     test_int8_paged_sparse_edges()
+    test_fp4_paged_shared_metadata_edges()
     test_sparse_workspace()

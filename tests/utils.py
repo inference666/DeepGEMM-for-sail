@@ -2927,10 +2927,9 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
     KV window = [0, context_lens[q]) per token (logical values are raw block ids), Q blocks pair
     only tokens of the same request (from the request start), and physical =
     block_table[q_token_base][logical // blocks_per_page] * blocks_per_page + logical % blocks_per_page.
-    PPU1.0 marks a split contiguous only if every logical block is consecutive
-    and belongs to one logical page, including partial splits. PPU1.5 keeps
-    the flag false. Check the full logical sequence independently of the
-    kernel's endpoint proof; aliased physical endpoints alone prove nothing.
+    Mark a split contiguous only if every logical block is consecutive and belongs to one
+    logical page, including partial splits. Check the full logical sequence independently
+    of the kernel's endpoint proof; aliased physical endpoints alone prove nothing.
     Split reservation order is nondeterministic (atomic); callers compare via canonical sorting."""
     blocks_per_split = SPARSE_SPLIT_KV // sparse_block_kv
     blocks_per_page = page_kv // sparse_block_kv
@@ -2978,8 +2977,7 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
             blocks_in_split = merged[split_offset * blocks_per_split:(split_offset + 1) * blocks_per_split]
             q0_slot_base, q1_slot_base = blocks_in_split[0][1], blocks_in_split[0][2]
             logical_ids = [block[0] for block in blocks_in_split]
-            is_contiguous = (get_arch_version() == 80 and
-                             all(logical == logical_ids[0] + offset
+            is_contiguous = (all(logical == logical_ids[0] + offset
                                  for offset, logical in enumerate(logical_ids)) and
                              all(logical // blocks_per_page == logical_ids[0] // blocks_per_page
                                  for logical in logical_ids))
@@ -2999,12 +2997,11 @@ def ref_paged_sparse_metadata(sparse_indices: torch.Tensor, num_blocks_per_q: li
 
 def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                                  request_ids: torch.Tensor) -> None:
-    """Check every split plus the architecture's exact paged schedule policy.
+    """Check every split and the shared paged schedule policy.
 
-    PPU1.0 divides reserved split indices evenly among slots, cutting each
-    slot's interval only at request-local Q-pair boundaries. PPU1.5 keeps
-    bounded-eight entries and stable wave balancing. Reservation order is
-    nondeterministic, so both policies use the actual decoded split order.
+    Divide reserved split indices evenly among slots, cutting each slot's
+    interval only at request-local Q-pair boundaries. Reservation order is
+    nondeterministic, so validation uses the actual decoded split order.
     """
     num_slots = get_sparse_num_slots()
     if decoded['num_kv_splits'] != ref['num_kv_splits']:
@@ -3025,7 +3022,7 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
                     exit(1)
             print("ERROR: metadata blocks mismatch (no differing block found?!)")
             exit(1)
-    # Both paged schedules must tile the split space exactly.
+    # The paged schedule must tile the split space exactly.
     # Schedule entries carry *kernel* split indices, so Q-block ranges come from the decoded
     # splits in kernel order (one base's range is contiguous — a CTA reserves it atomically).
     req = request_ids.cpu().numpy().tolist()
@@ -3082,49 +3079,27 @@ def verify_paged_sparse_metadata(decoded: dict, ref: dict, total_q_tokens: int,
         print(f"ERROR: paged schedule covers [0,{expect_begin}) but total splits = {total}")
         exit(1)
 
-    if get_arch_version() == 80:
-        per_slot = []
-        for slot in range(num_slots):
-            begin = ceil_div(total * slot, num_slots)
-            limit = ceil_div(total * (slot + 1), num_slots)
-            entries = []
-            while begin < limit:
-                base = decoded['splits'][begin]['q_token_base']
-                end = min(limit, base_ranges[base][1])
-                assert begin < end
-                entries.append((begin, end, base, base_pairing[base]))
-                begin = end
-            per_slot.append(entries)
-        expected_waves = max(1, max(map(len, per_slot)))
-        assert num_waves == expected_waves, (num_waves, expected_waves)
-        for wave in range(expected_waves):
-            for slot, entries in enumerate(per_slot):
-                expected = entries[wave] if wave < len(entries) else (0, 0, 0, 0)
-                actual = tuple(decoded['schedule'][wave * num_slots + slot])
-                assert actual == expected, (f'Paged split-window mismatch at wave {wave}, slot {slot}: '
-                                            f'{actual} vs {expected}')
-        return
-
-    # Verify the stable wave ordering, not only coverage: equal-sized entries
-    # retain Q order, and rotation (including the reversed two-wave tail) is exact.
-    ordered = []
-    for base, (begin, end) in sorted(base_ranges.items()):
-        entry_count = ceil_div(end - begin, 8)
-        size, larger = divmod(end - begin, entry_count)
-        for i in range(entry_count):
-            next_begin = begin + size + (i < larger)
-            ordered.append((begin, next_begin, base, base_pairing[base]))
-            begin = next_begin
-    expected_waves = max(1, ceil_div(len(ordered), num_slots))
+    per_slot = []
+    for slot in range(num_slots):
+        begin = ceil_div(total * slot, num_slots)
+        limit = ceil_div(total * (slot + 1), num_slots)
+        entries = []
+        while begin < limit:
+            base = decoded['splits'][begin]['q_token_base']
+            end = min(limit, base_ranges[base][1])
+            assert begin < end
+            entries.append((begin, end, base, base_pairing[base]))
+            begin = end
+        per_slot.append(entries)
+    expected_waves = max(1, max(map(len, per_slot)))
     assert num_waves == expected_waves, (num_waves, expected_waves)
-    ordered += [(0, 0, 0, 0)] * (num_waves * num_slots - len(ordered))
-    for wave in range(num_waves):
-        entries = sorted(ordered[wave * num_slots:(wave + 1) * num_slots], key=lambda e: e[1] - e[0])
-        for rank, entry in enumerate(entries):
-            slot = (num_slots - 1 - rank if num_waves == 2 and wave == 1 else
-                    (rank + num_slots - wave * num_slots // num_waves) % num_slots)
+    for wave in range(expected_waves):
+        for slot, entries in enumerate(per_slot):
+            expected = entries[wave] if wave < len(entries) else (0, 0, 0, 0)
             actual = tuple(decoded['schedule'][wave * num_slots + slot])
-            assert actual == entry, f"Paged wave ordering mismatch at wave {wave}, slot {slot}: {actual} vs {entry}"
+            assert actual == expected, (f'Paged split-window mismatch at wave {wave}, slot {slot}: '
+                                        f'{actual} vs {expected}')
+
 
 def check_int8_sparse_reference_chunks(q, kv, weights, logits, sparse_indices,
                                        num_blocks_per_q, context_starts, context_ends,

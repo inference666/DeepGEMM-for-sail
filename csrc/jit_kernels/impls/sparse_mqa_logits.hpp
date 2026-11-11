@@ -181,14 +181,13 @@ static void launch_sparse_mqa_logits_metadata(const torch::Tensor& metadata, tor
     // Dynamic smem: the packed merge output (2 × Cap words)
     const int smem_size = static_cast<int>(2 * num_max_blocks_cap * sizeof(uint32_t));
     const auto kernel_name = "sparse_mqa_logits_metadata";
-    const auto [arch_major, arch_minor] = device_runtime->get_arch_pair();
-    // Metadata producers have lower register/shared-memory costs than the INT8
-    // compute CTAs. On PPU0010, populate more producers without changing the
-    // schedule's num_slots columns or the compute launch geometry.
-    const uint32_t producer_multiplier = arch_major == 8 and arch_minor == 0 ? 4u : 1u;
+    // Metadata producers are independent of the compute CTAs. Populate more
+    // producers for paged request discovery without changing the schedule's
+    // num_slots columns or the compute launch geometry on either architecture.
+    constexpr uint32_t kProducerMultiplier = 4;
     const int num_metadata_ctas = is_paged
         ? static_cast<int>(std::min<uint64_t>(num_q_tokens,
-              static_cast<uint64_t>(num_slots) * producer_multiplier))
+              static_cast<uint64_t>(num_slots) * kProducerMultiplier))
         : ceil_div<int>(static_cast<int>(num_q_tokens), static_cast<int>(kBlockQ));
 
     auto args = SparseMqaLogitsMetadataRuntime::Args{
